@@ -1,0 +1,55 @@
+# =============================================================================
+# tak_chat_node configuration
+# =============================================================================
+#
+# This file configures the TakChatNode, which bridges ROS TakChat messages
+# to TAK GeoChat CoT XML and back.
+#
+# Topic names are relative to the node namespace (e.g., /warthog1).
+# =============================================================================
+
+tak_chat_node:
+  ros__parameters:
+
+    # -------------------------------------------------------------------------
+    # Identity
+    # -------------------------------------------------------------------------
+
+    # Callsign used as the robot's identity in TAK chat
+    callsign: "warthog1"
+
+    # Android device ID segment used in GeoChat UID generation
+    # Should be unique per robot/device
+    android_id: "dfac01d76beec661"
+
+    # TAK server flow tag key (provided by TAK server)
+    # Format: TAK-Server-<uuid>
+    tak_server_flow_tag_key: "TAK-Server-d520578543014e9cba1916fad77b9917"
+
+    # -------------------------------------------------------------------------
+    # TAK CoT topics (ROS <-> TAK bridge)
+    # -------------------------------------------------------------------------
+
+    # Outgoing GeoChat CoT XML (TakChatNode -> TAK bridge)
+    outgoing_cot_topic: "send_to_tak"
+
+    # Incoming GeoChat CoT XML (TAK bridge -> TakChatNode)
+    incoming_cot_topic: "incoming_cot"
+
+    # -------------------------------------------------------------------------
+    # TakChat ROS topics (Behavior Trees <-> TakChatNode)
+    # -------------------------------------------------------------------------
+
+    # Outgoing TakChat requests (BT -> TakChatNode)
+    tak_chat_out_topic: "tak_chat/out"
+
+    # Incoming TakChat events (TakChatNode -> BT)
+    tak_chat_in_topic: "tak_chat/in"
+
+    # -------------------------------------------------------------------------
+    # Navigation / Position
+    # -------------------------------------------------------------------------
+
+    # NavSatFix topic used to populate lat/lon in outgoing GeoChat messages
+    navsat_topic: "navsat"
+

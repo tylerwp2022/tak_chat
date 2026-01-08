@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.env
+.venv
+
+# ROS / colcon
+build/
+install/
+log/
+
+# Editor
+.vscode/
+.idea/
+
+# OS
+.DS_Store
