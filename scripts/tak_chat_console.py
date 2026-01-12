@@ -2,7 +2,7 @@
 """
 tak_chat_console.py
 
-Interactive console for sending TAK chat messages.
+Interactive console for sending TAK chat messages with granular UID control.
 
 Unlike tak_chat_test.py (which exits after sending), this node stays alive
 indefinitely. This solves the DDS discovery race condition because:
@@ -10,14 +10,38 @@ indefinitely. This solves the DDS discovery race condition because:
   2. We wait for tak_chat_node to discover us (one-time cost)
   3. All subsequent messages are delivered instantly and reliably
 
+NEW FEATURE: Granular UID Reuse for Testing
+--------------------------------------------
+You can independently control event UID and messageId to determine which
+identifier ATAK uses as the primary key for deduplication:
+
+  /reuse-both    - Reuse both event UID and messageId
+  /reuse-event   - Reuse event UID only (messageId random)
+  /reuse-msgid   - Reuse messageId only (event UID random)
+  /random        - Random UIDs (default)
+
+This allows systematic testing of ATAK's chat message deduplication logic.
+
 USAGE:
 ------
   ros2 run tak_chat tak_chat_console.py
 
-  # Then type messages interactively:
-  > TRILL: Hello there
-  > ALL: Broadcast to everyone
-  > quit
+  # Test 1: Do matching event UID + messageId cause overwrites?
+  > /reuse-both
+  > TRILL: test1
+  > TRILL: test2    (same event UID, same messageId)
+  
+  # Test 2: Does event UID alone matter?
+  > /random
+  > /reuse-event
+  > TRILL: test3    (generates event UID, random messageId)
+  > TRILL: test4    (same event UID, different messageId)
+  
+  # Test 3: Does messageId alone matter?
+  > /random
+  > /reuse-msgid
+  > TRILL: test5    (random event UID, generates messageId)
+  > TRILL: test6    (different event UID, same messageId)
 
 Or with a different namespace:
   ros2 run tak_chat tak_chat_console.py --namespace warthog2 --from warthog2
@@ -46,6 +70,12 @@ class TakChatConsole(Node):
     
     This node stays alive, which means DDS discovery only needs to happen
     once at startup. All subsequent messages are delivered reliably.
+    
+    Supports granular UID reuse for testing ATAK's deduplication logic:
+    - /reuse-both: Reuse event UID + messageId (test both together)
+    - /reuse-event: Reuse event UID only (test event UID as primary key)
+    - /reuse-msgid: Reuse messageId only (test messageId as primary key)
+    - /random: Random UIDs (default behavior)
     """
 
     def __init__(self, topic: str, callsign: str):
@@ -79,6 +109,14 @@ class TakChatConsole(Node):
         
         # Track message count
         self.message_count = 0
+        
+        # UID control - allows testing message overwrites in ATAK
+        # We track event UID and messageId separately to test which one ATAK uses
+        # as the primary key for deduplication
+        self.reuse_event_uid = False   # Reuse the event UID?
+        self.reuse_message_id = False  # Reuse the __chat messageId?
+        self.last_event_uid = None     # Stored event UID
+        self.last_message_id = None    # Stored messageId
 
         self.get_logger().info(f"TakChatConsole initialized")
         self.get_logger().info(f"  Topic:    {topic}")
@@ -129,16 +167,60 @@ class TakChatConsole(Node):
             print(f"[ERROR] No subscribers! Message not sent.")
             return False
         
+        # Create the TakChat message
         msg = self.TakChat()
         msg.origin = self.callsign
         msg.destination = destination
         msg.message = message
         msg.timestamp = get_zulu_time()
         
+        # Handle UID logic based on reuse modes
+        # We encode both event_uid and message_id into the single uid field
+        # Format: "event_uid|message_id"
+        # This allows independent control of each identifier
+        
+        import uuid
+        
+        # Generate or reuse event UID
+        if self.reuse_event_uid:
+            if self.last_event_uid is None:
+                self.last_event_uid = str(uuid.uuid4())
+                print(f"[EVENT UID] Generated: {self.last_event_uid[:16]}...")
+            event_uid = self.last_event_uid
+        else:
+            event_uid = ""
+            self.last_event_uid = None
+        
+        # Generate or reuse messageId
+        if self.reuse_message_id:
+            if self.last_message_id is None:
+                self.last_message_id = str(uuid.uuid4())
+                print(f"[MESSAGE ID] Generated: {self.last_message_id[:16]}...")
+            message_id = self.last_message_id
+        else:
+            message_id = ""
+            self.last_message_id = None
+        
+        # Encode both into uid field: "event_uid|message_id"
+        msg.uid = f"{event_uid}|{message_id}"
+        
         self.pub.publish(msg)
         self.message_count += 1
         
-        print(f"[SENT #{self.message_count}] {self.callsign} -> {destination}: \"{message}\"")
+        # Log the send with UID info
+        uid_parts = []
+        if self.reuse_event_uid:
+            uid_parts.append(f"EventUID={self.last_event_uid[:8]}...")
+        else:
+            uid_parts.append("EventUID=random")
+        
+        if self.reuse_message_id:
+            uid_parts.append(f"MsgID={self.last_message_id[:8]}...")
+        else:
+            uid_parts.append("MsgID=random")
+        
+        uid_info = f" [{', '.join(uid_parts)}]"
+        print(f"[SENT #{self.message_count}] {self.callsign} -> {destination}: \"{message}\"{uid_info}")
         return True
 
     def run_console(self):
@@ -152,12 +234,27 @@ class TakChatConsole(Node):
         print("Commands:")
         print("  DESTINATION: message   - Send to specific destination")
         print("  ALL: message           - Broadcast to all callsigns")
+        print("  /reuse-event           - Reuse event UID only")
+        print("  /reuse-msgid           - Reuse messageId only")
+        print("  /reuse-both            - Reuse both (event UID + messageId)")
+        print("  /random                - Random UIDs (default)")
         print("  /status                - Show connection status")
         print("  /quit or Ctrl+C        - Exit")
         print()
-        print("Examples:")
-        print("  TRILL: Hello there")
-        print("  ALL: System online")
+        print("Testing Workflow:")
+        print("  /reuse-both            Test: both IDs match")
+        print("  TRILL: msg1            (generates IDs)")
+        print("  TRILL: msg2            (reuses both IDs)")
+        print()
+        print("  /random                Reset")
+        print("  /reuse-event           Test: only event UID matches")
+        print("  TRILL: msg3            (new event UID, random msgId)")
+        print("  TRILL: msg4            (same event UID, random msgId)")
+        print()
+        print("  /random                Reset")
+        print("  /reuse-msgid           Test: only messageId matches")
+        print("  TRILL: msg5            (random event UID, new msgId)")
+        print("  TRILL: msg6            (random event UID, same msgId)")
         print("=" * 60)
         print()
         
@@ -175,18 +272,77 @@ class TakChatConsole(Node):
                 if not line:
                     continue
                 
-                # Handle commands
+                # Handle quit commands
                 if line.lower() in ('/quit', '/exit', 'quit', 'exit'):
                     print("Goodbye!")
                     break
                 
+                # Handle status command
                 if line.lower() == '/status':
                     count = self.pub.get_subscription_count()
+                    
+                    # Build status string
+                    if self.reuse_event_uid and self.reuse_message_id:
+                        mode = "REUSE BOTH"
+                        details = f"EventUID={self.last_event_uid[:16] if self.last_event_uid else 'not yet generated'}..., MsgID={self.last_message_id[:16] if self.last_message_id else 'not yet generated'}..."
+                    elif self.reuse_event_uid:
+                        mode = "REUSE EVENT UID ONLY"
+                        details = f"EventUID={self.last_event_uid[:16] if self.last_event_uid else 'not yet generated'}..."
+                    elif self.reuse_message_id:
+                        mode = "REUSE MESSAGE ID ONLY"
+                        details = f"MsgID={self.last_message_id[:16] if self.last_message_id else 'not yet generated'}..."
+                    else:
+                        mode = "RANDOM"
+                        details = "All IDs randomly generated"
+                    
                     print(f"[STATUS] Subscribers: {count}, Messages sent: {self.message_count}")
+                    print(f"[STATUS] Mode: {mode}")
+                    print(f"[STATUS] {details}")
                     continue
                 
+                # Handle reuse-event command
+                if line.lower() in ('/reuse-event', '/reuse-uid'):
+                    self.reuse_event_uid = True
+                    self.reuse_message_id = False
+                    self.last_message_id = None  # Clear msgId so it generates new ones
+                    print(f"[MODE] REUSE EVENT UID ONLY")
+                    print(f"[MODE] Event UID will be reused, messageId will be random")
+                    print(f"[MODE] This tests if ATAK uses event UID as primary key")
+                    continue
+                
+                # Handle reuse-msgid command
+                if line.lower() in ('/reuse-msgid', '/reuse-messageid'):
+                    self.reuse_event_uid = False
+                    self.reuse_message_id = True
+                    self.last_event_uid = None  # Clear event UID so it generates new ones
+                    print(f"[MODE] REUSE MESSAGE ID ONLY")
+                    print(f"[MODE] MessageId will be reused, event UID will be random")
+                    print(f"[MODE] This tests if ATAK uses messageId as primary key")
+                    continue
+                
+                # Handle reuse-both command
+                if line.lower() in ('/reuse-both', '/reuse-all'):
+                    self.reuse_event_uid = True
+                    self.reuse_message_id = True
+                    print(f"[MODE] REUSE BOTH (event UID + messageId)")
+                    print(f"[MODE] Both identifiers will be reused")
+                    print(f"[MODE] This tests if ATAK treats identical IDs as updates")
+                    continue
+                
+                # Handle random command (disable all reuse)
+                if line.lower() in ('/random', '/new-uid', '/clear'):
+                    self.reuse_event_uid = False
+                    self.reuse_message_id = False
+                    self.last_event_uid = None
+                    self.last_message_id = None
+                    print(f"[MODE] RANDOM (default)")
+                    print(f"[MODE] All identifiers will be randomly generated")
+                    continue
+                
+                # Handle unknown commands
                 if line.startswith('/'):
                     print(f"[ERROR] Unknown command: {line}")
+                    print("        Valid: /reuse-event, /reuse-msgid, /reuse-both, /random, /status, /quit")
                     continue
                 
                 # Parse "DESTINATION: message" format

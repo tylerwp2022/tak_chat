@@ -28,13 +28,27 @@
 //     a minimum delay between them (default 1 second). This ensures each
 //     message has a distinct timestamp so TAK/ATAK can properly order them.
 //
+//   - COMMS-AWARE DELIVERY: Integrates with west_point_comms_sim to only send
+//     messages to destinations that are reachable via the mesh network.
+//     Messages to unreachable destinations are suppressed with a warning.
+//     If comms_status is not published, defaults to allowing all destinations.
+//
+//   - UID OVERRIDE (for testing): If the TakChat message includes a non-empty
+//     'uid' field, that UID will be used for both the event UID and the __chat
+//     messageId in the CoT XML instead of generating random values. This allows
+//     testing whether ATAK treats messages with identical UIDs+messageIds as
+//     updates/replacements.
+//
 // MESSAGE FLOW
 // ------------
 //   A) OUTGOING (ROS -> TAK)
 //      - BT nodes publish TakChat requests to tak_chat/out
 //      - If destination is "ALL", fans out to all allowed callsigns
-//      - Messages are queued and sent with delay between them
+//      - Each destination is checked against comms_status transitive list
+//      - Messages to unreachable destinations are suppressed
+//      - Reachable messages are queued and sent with delay between them
 //      - Timestamp is generated when actually sent (not when received)
+//      - If TakChat.uid is non-empty, uses that UID; otherwise generates random
 //      - Publishes to send_to_tak with retry logic
 //
 //   B) INCOMING (TAK -> ROS)
@@ -52,6 +66,7 @@
 //   navsat_topic:           GPS source for location (default: "navsat")
 //   tak_chat_out_topic:     Incoming requests from BT (default: "tak_chat/out")
 //   tak_chat_in_topic:      Outgoing events to BT (default: "tak_chat/in")
+//   comms_topic:            Mesh connectivity status (default: "comms")
 //   allowed_callsigns_file: Path to YAML with allowed callsigns
 //   send_delay_s:           Min delay between sends (default: 1.0)
 //   retry_timeout_s:        Total time to keep retrying (default: 10.0)
@@ -65,10 +80,14 @@
 #include <sensor_msgs/msg/nav_sat_fix.hpp>
 #include <tak_chat/msg/tak_chat.hpp>
 
+// Comms status from west_point_comms_sim
+#include <west_point_comms_sim/msg/comms_status.hpp>
+
 #include <string>
 #include <vector>
 #include <mutex>
 #include <queue>
+#include <deque>
 #include <set>
 #include <map>
 #include <sstream>
@@ -86,27 +105,22 @@ static const std::string BROADCAST_DESTINATION = "ALL";
 
 
 //==============================================================================
-// ClockOffset - Tracks clock difference for a specific callsign
+// LastIncomingMessage - Tracks the last message received from each callsign
 //==============================================================================
 //
-// ATAK devices may be disconnected from the internet and have drifting clocks.
-// To ensure messages appear in correct order on their chat view, we track the
-// offset between our clock and each callsign's clock.
+// To ensure replies appear AFTER the incoming message in ATAK's chat view,
+// we track the timestamp of each callsign's last message. When we reply,
+// we use their timestamp + a delay as our outgoing timestamp.
 //
-// When we receive a message, we calculate:
-//   offset = our_time - their_timestamp
-//
-// When we send TO that callsign, we adjust:
-//   adjusted_timestamp = our_time - offset
-//
-// This makes our messages appear with timestamps relative to THEIR clock,
-// ensuring proper ordering in their chat view.
+// This is simpler and more reliable than calculating clock offsets because:
+//   1. It guarantees ordering regardless of clock drift
+//   2. It handles network latency naturally
+//   3. It works even if their clock jumps around
 //
 //==============================================================================
-struct ClockOffset {
-    double offset_seconds;                              // our_time - their_time
-    std::chrono::steady_clock::time_point last_updated; // When offset was last calculated
-    int sample_count;                                   // Number of messages used to calculate
+struct LastIncomingMessage {
+    std::string timestamp;                              // ISO8601 timestamp from their message
+    std::chrono::steady_clock::time_point received_at;  // When we received it (for staleness check)
 };
 
 
@@ -124,6 +138,7 @@ struct ClockOffset {
 struct QueuedMessage {
     std::string destination;                // Target callsign
     std::string message;                    // Message text
+    std::string override_uid;               // Optional: if non-empty, use this UID instead of random
     std::chrono::steady_clock::time_point queued_time;  // When added to queue
 };
 
@@ -176,8 +191,7 @@ public:
         : Node("tak_chat_node", options),
           fix_received_(false),
           current_lat_(0.0),
-          current_lon_(0.0),
-          last_send_time_(std::chrono::steady_clock::time_point::min())
+          current_lon_(0.0)
     {
         //----------------------------------------------------------------------
         // Declare Parameters
@@ -195,6 +209,7 @@ public:
         this->declare_parameter<std::string>("navsat_topic", "navsat");
         this->declare_parameter<std::string>("tak_chat_out_topic", "tak_chat/out");
         this->declare_parameter<std::string>("tak_chat_in_topic", "tak_chat/in");
+        this->declare_parameter<std::string>("comms_topic", "comms");
 
         // Allowed callsigns configuration
         this->declare_parameter<std::string>("allowed_callsigns_file",
@@ -203,10 +218,11 @@ public:
         // Retry/reliability parameters - tuned for DDS discovery timing
         this->declare_parameter<double>("retry_timeout_s", 10.0);     // Total retry window
         this->declare_parameter<double>("retry_interval_s", 1.0);     // Time between publishes
-        this->declare_parameter<int>("min_retry_count", 2);           // Min publishes even with subscriber
+        this->declare_parameter<int>("min_retry_count", 1);           // Min publishes even with subscriber
         
         // Send queue parameters - ensures messages have distinct timestamps
-        this->declare_parameter<double>("send_delay_s", 1.0);         // Min delay between sends
+        this->declare_parameter<double>("send_delay_s", 1.0);         // Min delay between sends to same dest
+        this->declare_parameter<double>("reply_delay_s", 0.5);        // Buffer added to their timestamp before replying
 
         //----------------------------------------------------------------------
         // Read Parameters
@@ -220,12 +236,14 @@ public:
         const std::string navsat_topic = this->get_parameter("navsat_topic").as_string();
         const std::string tak_chat_out_topic = this->get_parameter("tak_chat_out_topic").as_string();
         const std::string tak_chat_in_topic = this->get_parameter("tak_chat_in_topic").as_string();
+        const std::string comms_topic = this->get_parameter("comms_topic").as_string();
         const std::string allowed_callsigns_file = this->get_parameter("allowed_callsigns_file").as_string();
 
         retry_timeout_s_ = this->get_parameter("retry_timeout_s").as_double();
         retry_interval_s_ = this->get_parameter("retry_interval_s").as_double();
         min_retry_count_ = this->get_parameter("min_retry_count").as_int();
         send_delay_s_ = this->get_parameter("send_delay_s").as_double();
+        reply_delay_s_ = this->get_parameter("reply_delay_s").as_double();
 
         //----------------------------------------------------------------------
         // Load Allowed Callsigns from YAML
@@ -272,6 +290,12 @@ public:
         sub_navsat_ = this->create_subscription<sensor_msgs::msg::NavSatFix>(
             navsat_topic, qos_reliable,
             std::bind(&TakChatNode::navsatCallback, this, std::placeholders::_1));
+
+        // Comms status from west_point_comms_sim
+        // This tells us which destinations are reachable via mesh network
+        sub_comms_status_ = this->create_subscription<west_point_comms_sim::msg::CommsStatus>(
+            comms_topic, qos_reliable,
+            std::bind(&TakChatNode::commsStatusCallback, this, std::placeholders::_1));
 
         // TakChat requests from BT nodes and test scripts
         // We use event callbacks to log when publishers connect/disconnect
@@ -329,13 +353,18 @@ public:
         RCLCPP_INFO(this->get_logger(), "  TakChat IN topic:     %s", tak_chat_in_topic.c_str());
         RCLCPP_INFO(this->get_logger(), "  Outgoing CoT topic:   %s", outgoing_cot_topic.c_str());
         RCLCPP_INFO(this->get_logger(), "  Incoming CoT topic:   %s", incoming_cot_topic.c_str());
-        RCLCPP_INFO(this->get_logger(), "  Send delay:           %.1fs (between messages)", send_delay_s_);
+        RCLCPP_INFO(this->get_logger(), "  Comms topic:          %s", comms_topic.c_str());
+        RCLCPP_INFO(this->get_logger(), "  Send delay:           %.1fs (between consecutive messages)", send_delay_s_);
+        RCLCPP_INFO(this->get_logger(), "  Reply delay:          %.1fs (buffer added to their timestamp)", reply_delay_s_);
         RCLCPP_INFO(this->get_logger(), "  Retry timeout:        %.1fs", retry_timeout_s_);
         RCLCPP_INFO(this->get_logger(), "  Retry interval:       %.1fs", retry_interval_s_);
         RCLCPP_INFO(this->get_logger(), "  Min retry count:      %d", min_retry_count_);
         RCLCPP_INFO(this->get_logger(), "  Allowed callsigns:    %zu loaded", allowed_callsigns_.size());
         RCLCPP_INFO(this->get_logger(), "  Broadcast destination: '%s' -> fans out to all allowed",
                     BROADCAST_DESTINATION.c_str());
+        RCLCPP_INFO(this->get_logger(), "  Comms mode:           Checking for 'base_station' in comms_status");
+        RCLCPP_INFO(this->get_logger(), "                        (if comms_sim not running, defaults to comms OK)");
+        RCLCPP_INFO(this->get_logger(), "  UID override:         Supported via TakChat.uid field (for testing)");
         RCLCPP_INFO(this->get_logger(), "TakChatNode starting...");
     }
 
@@ -429,22 +458,183 @@ private:
     }
 
     //==========================================================================
+    // Callback: CommsStatus - Update mesh network connectivity
+    //==========================================================================
+    
+    /**
+     * @brief Handle comms status updates from west_point_comms_sim.
+     * 
+     * The CommsStatus message contains:
+     *   - direct[]: Entities this robot can communicate with directly
+     *   - transitive[]: Entities reachable through the mesh network
+     * 
+     * TAK COMMUNICATION MODEL:
+     * ------------------------
+     * All TAK/ATAK messages go through the base_station (the TAK server).
+     * The destination callsigns (like "White Cell", "TRILL") are ATAK users
+     * that are all reached through the base_station.
+     * 
+     * Therefore, the comms check is binary:
+     *   - "base_station" in transitive → CAN send TAK messages
+     *   - "base_station" NOT in transitive → CANNOT send TAK messages
+     * 
+     * If this callback is never called (comms_sim not running), we default
+     * to allowing all messages (assumes comms are up).
+     * 
+     * @param msg The CommsStatus message from west_point_comms_sim
+     */
+    void commsStatusCallback(const west_point_comms_sim::msg::CommsStatus::SharedPtr msg)
+    {
+        std::lock_guard<std::mutex> lock(comms_mutex_);
+        
+        // Check if base_station is reachable (either directly or transitively)
+        bool new_has_comms = false;
+        
+        // Check transitive list (includes multi-hop paths)
+        for (const auto& entity : msg->transitive) {
+            if (entity == "base_station") {
+                new_has_comms = true;
+                break;
+            }
+        }
+        
+        // Also check direct list (should be subset of transitive, but be safe)
+        if (!new_has_comms) {
+            for (const auto& entity : msg->direct) {
+                if (entity == "base_station") {
+                    new_has_comms = true;
+                    break;
+                }
+            }
+        }
+        
+        // First time receiving comms status - log the transition
+        if (!comms_status_received_) {
+            comms_status_received_ = true;
+            RCLCPP_INFO(this->get_logger(),
+                "[Comms] First comms_status received - base_station %s",
+                new_has_comms ? "REACHABLE (TAK enabled)" : "UNREACHABLE (TAK disabled)");
+        }
+        // Log state changes
+        else if (new_has_comms != has_base_station_comms_) {
+            if (new_has_comms) {
+                RCLCPP_INFO(this->get_logger(),
+                    "[Comms] Connection to base_station RESTORED - TAK messaging enabled");
+            } else {
+                RCLCPP_WARN(this->get_logger(),
+                    "[Comms] Connection to base_station LOST - TAK messaging disabled");
+            }
+        }
+        
+        has_base_station_comms_ = new_has_comms;
+    }
+    
+    /**
+     * @brief Check if TAK messages can be sent (base_station is reachable).
+     * 
+     * BEHAVIOR:
+     *   - If comms_status has never been received (comms_sim not running):
+     *     Returns true (default to allowing TAK messages)
+     *   - If comms_status is active:
+     *     Returns true only if "base_station" is in the transitive list
+     * 
+     * @return true if TAK messages can be sent
+     */
+    bool hasComms()
+    {
+        std::lock_guard<std::mutex> lock(comms_mutex_);
+        
+        // If we've never received comms_status, assume comms are up
+        // This is the "comms_sim not running" fallback
+        if (!comms_status_received_) {
+            return true;
+        }
+        
+        return has_base_station_comms_;
+    }
+    
+    /**
+     * @brief Get the current comms status for logging/debugging.
+     * 
+     * @return A string describing the current comms state
+     */
+    std::string getCommsStatusString()
+    {
+        std::lock_guard<std::mutex> lock(comms_mutex_);
+        
+        if (!comms_status_received_) {
+            return "no comms_status received (defaulting to comms OK)";
+        }
+        
+        return has_base_station_comms_ 
+            ? "base_station REACHABLE" 
+            : "base_station UNREACHABLE";
+    }
+
+    //==========================================================================
     // Callback: TakChat OUT (ROS -> TAK)
     //==========================================================================
     
     /**
      * @brief Handle outgoing chat requests from BT nodes.
      * 
-     * Messages are added to the send queue and sent one at a time with a
-     * minimum delay between them. This ensures messages have distinct
-     * timestamps and arrive at ATAK in the correct order.
+     * Messages are checked for base_station connectivity before being queued:
+     *   - If base_station is reachable (or comms_sim not running): queue message
+     *   - If base_station is unreachable: suppress with warning
+     * 
+     * For broadcast messages ("ALL"), all destinations are queued if comms are up,
+     * or all are suppressed if comms are down.
+     * 
+     * UID OVERRIDE SUPPORT:
+     * ---------------------
+     * If the TakChat message includes a non-empty 'uid' field, that UID will be
+     * passed through to the CoT generation instead of generating a random one.
+     * This allows testing whether ATAK treats messages with identical UIDs as
+     * updates/replacements rather than new messages.
      */
     void takChatOutCallback(const tak_chat::msg::TakChat::SharedPtr msg)
     {
-        RCLCPP_INFO(this->get_logger(),
-            "[TakChat RECV] origin='%s' dest='%s' msg='%s'",
-            msg->origin.c_str(), msg->destination.c_str(), msg->message.c_str());
+        // Parse the uid field which encodes: "event_uid|message_id"
+        std::string uid_field = msg->uid;
+        std::string event_uid_part;
+        std::string message_id_part;
         
+        size_t separator_pos = uid_field.find('|');
+        if (separator_pos != std::string::npos) {
+            // Format: "event_uid|message_id"
+            event_uid_part = uid_field.substr(0, separator_pos);
+            message_id_part = uid_field.substr(separator_pos + 1);
+        } else if (!uid_field.empty()) {
+            // Legacy format: use same value for both (backward compatible)
+            event_uid_part = uid_field;
+            message_id_part = uid_field;
+        }
+        
+        // Build log string
+        std::string uid_info = "";
+        if (!event_uid_part.empty() || !message_id_part.empty()) {
+            std::ostringstream oss;
+            oss << " [";
+            if (!event_uid_part.empty()) {
+                oss << "EventUID=" << event_uid_part.substr(0, std::min(size_t(8), event_uid_part.length())) << "...";
+            } else {
+                oss << "EventUID=random";
+            }
+            oss << ", ";
+            if (!message_id_part.empty()) {
+                oss << "MsgID=" << message_id_part.substr(0, std::min(size_t(8), message_id_part.length())) << "...";
+            } else {
+                oss << "MsgID=random";
+            }
+            oss << "]";
+            uid_info = oss.str();
+        }
+        
+        RCLCPP_INFO(this->get_logger(),
+            "[TakChat RECV] origin='%s' dest='%s' msg='%s'%s",
+            msg->origin.c_str(), msg->destination.c_str(), msg->message.c_str(), uid_info.c_str());
+        
+        // Verify the message is from this robot
         if (msg->origin != callsign_) {
             RCLCPP_WARN(this->get_logger(),
                 "[TakChat REJECTED] origin='%s' does not match our callsign='%s'",
@@ -452,28 +642,43 @@ private:
             return;
         }
 
-        // Add to send queue - messages will be sent with delay between them
-        // The timestamp will be generated when actually sent, not now
+        // Check if we have comms to base_station (TAK server)
+        if (!hasComms()) {
+            RCLCPP_WARN(this->get_logger(),
+                "[TakChat SUPPRESSED] No comms to base_station - message not sent: '%s'",
+                msg->message.c_str());
+            return;
+        }
+
+        // Pass the uid field through (will be decoded again in buildGeoChatCoT)
+        std::string override_uid = msg->uid;
+
+        // Handle broadcast vs single destination
         if (msg->destination == BROADCAST_DESTINATION) {
+            // Fan out to all allowed callsigns
             RCLCPP_INFO(this->get_logger(),
-                "[TakChat QUEUED] BROADCAST | Message: %s", msg->message.c_str());
+                "[TakChat BROADCAST] Queuing to %zu destinations | Message: %s%s",
+                allowed_callsigns_.size(), msg->message.c_str(), uid_info.c_str());
             
-            // Fan out to all allowed callsigns - each gets queued separately
             for (const auto& dest : allowed_callsigns_) {
-                addToSendQueue(dest, msg->message);
+                addToSendQueue(dest, msg->message, override_uid);
             }
-        } else {
-            RCLCPP_INFO(this->get_logger(),
-                "[TakChat QUEUED] To: %s | Message: %s",
-                msg->destination.c_str(), msg->message.c_str());
             
-            addToSendQueue(msg->destination, msg->message);
+        } else {
+            // Single destination
+            RCLCPP_INFO(this->get_logger(),
+                "[TakChat QUEUED] To: %s | Message: %s%s",
+                msg->destination.c_str(), msg->message.c_str(), uid_info.c_str());
+            
+            addToSendQueue(msg->destination, msg->message, override_uid);
         }
         
         // Log queue size for debugging
         std::lock_guard<std::mutex> lock(send_queue_mutex_);
-        RCLCPP_INFO(this->get_logger(),
-            "[TakChat QUEUE] %zu message(s) waiting to be sent", send_queue_.size());
+        if (!send_queue_.empty()) {
+            RCLCPP_INFO(this->get_logger(),
+                "[TakChat QUEUE] %zu message(s) waiting to be sent", send_queue_.size());
+        }
     }
 
     //==========================================================================
@@ -483,91 +688,143 @@ private:
     /**
      * @brief Add a message to the send queue.
      * 
-     * Messages wait in the queue until the send delay has elapsed since
-     * the last message was sent. This ensures distinct timestamps.
+     * Messages wait in the queue until either:
+     *   - It's the first message to this destination, OR
+     *   - send_delay_s has elapsed since the last send to this destination
+     * 
+     * This allows simultaneous sends to DIFFERENT destinations while
+     * maintaining proper timestamp ordering for the SAME destination.
      * 
      * @param destination Target callsign
      * @param message Message text to send
+     * @param override_uid Optional UID to use instead of random generation
      */
-    void addToSendQueue(const std::string& destination, const std::string& message)
+    void addToSendQueue(const std::string& destination, 
+                       const std::string& message,
+                       const std::string& override_uid = "")
     {
         QueuedMessage queued;
         queued.destination = destination;
         queued.message = message;
+        queued.override_uid = override_uid;
         queued.queued_time = std::chrono::steady_clock::now();
         
         std::lock_guard<std::mutex> lock(send_queue_mutex_);
-        send_queue_.push(queued);
+        send_queue_.push_back(queued);
     }
     
     /**
      * @brief Timer callback to process the send queue.
      * 
-     * Sends one message from the queue if:
-     *   1. The queue is not empty
-     *   2. At least send_delay_s has elapsed since the last send
+     * SIMULTANEOUS MULTI-DESTINATION SENDING:
+     * ---------------------------------------
+     * Messages to DIFFERENT destinations can be sent simultaneously because
+     * each destination has its own independent chat thread.
      * 
-     * This ensures messages have distinct, well-separated timestamps
-     * so TAK server and ATAK can properly order them.
+     * The delay (send_delay_s) only applies when sending consecutive messages
+     * to the SAME destination, ensuring distinct timestamps for proper ordering.
+     * 
+     * For example, a broadcast to 5 callsigns will send all 5 messages at once
+     * (or within the same timer tick), rather than taking 5 seconds.
      */
     void sendQueueTimerCallback()
     {
         auto now = std::chrono::steady_clock::now();
+        auto wall_now = std::chrono::system_clock::now();
+        double current_wall_time = std::chrono::duration<double>(
+            wall_now.time_since_epoch()).count();
         
-        // First check if there's anything to send
-        size_t queue_size;
+        // Collect messages that are ready to send
+        std::vector<QueuedMessage> ready_to_send;
+        
         {
             std::lock_guard<std::mutex> lock(send_queue_mutex_);
-            queue_size = send_queue_.size();
-        }
-        
-        if (queue_size == 0) {
-            return;  // Nothing to send
-        }
-        
-        // Check if enough time has passed since last send
-        // Special case: if last_send_time_ is min (never sent), allow immediate send
-        bool first_send = (last_send_time_ == std::chrono::steady_clock::time_point::min());
-        
-        if (!first_send) {
-            double since_last_send = std::chrono::duration<double>(
-                now - last_send_time_).count();
             
-            if (since_last_send < send_delay_s_) {
-                return;  // Not time to send yet
+            if (send_queue_.empty()) {
+                return;  // Nothing to send
+            }
+            
+            // Iterate through queue and collect messages ready to send
+            // We'll remove them after collecting to avoid iterator invalidation
+            auto it = send_queue_.begin();
+            while (it != send_queue_.end()) {
+                const std::string& dest = it->destination;
+                
+                // Check both send delay (between consecutive sends) AND reply delay
+                // (waiting until we've passed their message timestamp)
+                bool can_send = true;
+                
+                // Check 1: Have we sent to this destination recently?
+                auto last_send_it = last_send_time_per_dest_.find(dest);
+                if (last_send_it != last_send_time_per_dest_.end()) {
+                    double since_last_send = std::chrono::duration<double>(
+                        now - last_send_it->second).count();
+                    
+                    if (since_last_send < send_delay_s_) {
+                        // Not ready yet - need to wait between consecutive sends
+                        can_send = false;
+                    }
+                }
+                
+                // Check 2: Have we passed their message timestamp?
+                // This handles clock skew - we wait until our wall clock has passed
+                // their timestamp + buffer, ensuring our reply arrives at TAK server
+                // after their message's server-assigned timestamp.
+                auto earliest_it = earliest_reply_time_per_dest_.find(dest);
+                if (can_send && earliest_it != earliest_reply_time_per_dest_.end()) {
+                    double earliest_reply_time = earliest_it->second;
+                    
+                    if (current_wall_time < earliest_reply_time) {
+                        // Not ready yet - our clock hasn't passed their timestamp
+                        double wait_remaining = earliest_reply_time - current_wall_time;
+                        RCLCPP_DEBUG(this->get_logger(),
+                            "[Reply Delay] Waiting %.1fs more before sending to %s (clock skew handling)",
+                            wait_remaining, dest.c_str());
+                        can_send = false;
+                    }
+                }
+                
+                if (can_send) {
+                    ready_to_send.push_back(*it);
+                    // Update last send time for this destination
+                    last_send_time_per_dest_[dest] = now;
+                    // Remove from queue
+                    it = send_queue_.erase(it);
+                } else {
+                    ++it;
+                }
             }
         }
         
-        // Get next message from queue
-        QueuedMessage queued;
+        // Now send all ready messages (outside the lock)
+        for (auto& queued : ready_to_send) {
+            // Re-check connectivity at send time
+            if (!hasComms()) {
+                RCLCPP_WARN(this->get_logger(),
+                    "[TakChat DROPPED] Comms to base_station lost while queued - "
+                    "message dropped: '%s' (to: %s)",
+                    queued.message.c_str(), queued.destination.c_str());
+                continue;
+            }
+            
+            std::string uid_info = queued.override_uid.empty() ? "" : " [UID: " + queued.override_uid + "]";
+            RCLCPP_INFO(this->get_logger(),
+                "[TakChat SENDING] To: %s | Message: '%s'%s",
+                queued.destination.c_str(), queued.message.c_str(), uid_info.c_str());
+            
+            // Send the message (timestamp determined by sendMessage based on
+            // any incoming messages from this destination)
+            sendMessage(queued.destination, queued.message, queued.override_uid);
+        }
+        
+        // Log if there are still messages waiting
         {
             std::lock_guard<std::mutex> lock(send_queue_mutex_);
-            if (send_queue_.empty()) {
-                return;  // Race condition - queue was emptied
+            if (!send_queue_.empty()) {
+                RCLCPP_DEBUG(this->get_logger(),
+                    "[TakChat QUEUE] %zu message(s) still waiting (rate-limited)",
+                    send_queue_.size());
             }
-            queued = send_queue_.front();
-            send_queue_.pop();
-            queue_size = send_queue_.size();
-        }
-        
-        // Generate timestamp NOW (when actually sending)
-        std::string timestamp = nowISO();
-        
-        RCLCPP_INFO(this->get_logger(),
-            "[TakChat SENDING] To: %s | Message: '%s' | timestamp=%s",
-            queued.destination.c_str(), queued.message.c_str(), timestamp.c_str());
-        
-        // Send the message (moves to pending for retry tracking)
-        sendMessage(queued.destination, queued.message, timestamp);
-        
-        // Update last send time
-        last_send_time_ = now;
-        
-        // Log remaining queue size
-        if (queue_size > 0) {
-            RCLCPP_INFO(this->get_logger(),
-                "[TakChat QUEUE] %zu message(s) still waiting (next in %.1fs)",
-                queue_size, send_delay_s_);
         }
     }
 
@@ -579,15 +836,17 @@ private:
      * @brief Send a message and add to pending for retry tracking.
      * 
      * This is called from the send queue timer when it's time to actually
-     * send a message. The timestamp is generated fresh at send time.
+     * send a message. The timestamp is determined by getResponseTimestamp()
+     * to ensure proper ordering relative to any incoming messages from this
+     * destination.
      * 
      * @param destination Target callsign
      * @param message Message text to send
-     * @param timestamp Timestamp to use in the CoT XML
+     * @param override_uid Optional UID to use instead of random generation
      */
     void sendMessage(const std::string& destination, 
                      const std::string& message,
-                     const std::string& timestamp)
+                     const std::string& override_uid = "")
     {
         std::string key = destination + "|" + message;
 
@@ -602,8 +861,12 @@ private:
             }
         }
 
-        // Build CoT XML with the current timestamp
-        std::string cot_xml = buildGeoChatCoT(callsign_, destination, message, timestamp);
+        // Get the appropriate timestamp for this destination
+        // This ensures our reply appears AFTER their last message in ATAK
+        std::string timestamp = getResponseTimestamp(destination);
+
+        // Build CoT XML with the response timestamp and optional UID override
+        std::string cot_xml = buildGeoChatCoT(callsign_, destination, message, timestamp, override_uid);
 
         PendingMessage pending;
         pending.destination = destination;
@@ -782,10 +1045,9 @@ private:
             return;
         }
 
-        // Calculate clock offset for this sender
-        // This helps us send responses with timestamps that appear in correct order
-        // on their device, even if their clock is drifting
-        updateClockOffset(sender, timestamp);
+        // Record this message's timestamp so when we reply, our response
+        // will have a timestamp that appears AFTER theirs in ATAK's chat
+        recordIncomingMessage(sender, timestamp);
 
         RCLCPP_INFO(this->get_logger(),
             "[TakChat IN] From: %s | To: %s | Message: %s",
@@ -796,107 +1058,214 @@ private:
         tak_msg.destination = recipient;
         tak_msg.message = message;
         tak_msg.timestamp = timestamp;
+        tak_msg.uid = "";  // Not needed for incoming messages
 
         pub_tak_chat_in_->publish(tak_msg);
     }
     
     //==========================================================================
-    // Clock Offset Management
+    // Last Incoming Message Tracking (for proper response ordering)
     //==========================================================================
     
     /**
-     * @brief Update the clock offset for a callsign based on their message timestamp.
+     * @brief Record the timestamp of an incoming message from a callsign.
      * 
-     * Calculates the difference between our clock and theirs:
-     *   offset = our_time - their_time
+     * This function serves TWO purposes:
      * 
-     * If their clock is behind ours, offset is positive.
-     * If their clock is ahead of ours, offset is negative.
+     * 1. TIMESTAMP TRACKING: Records their message timestamp so that when we
+     *    reply, we can use their_timestamp + RESPONSE_DELAY_S to ensure our
+     *    reply appears AFTER their message in ATAK's chat view.
      * 
-     * Uses exponential moving average to smooth out network jitter.
+     * 2. SEND DELAY ENFORCEMENT: Stores their parsed timestamp so the send
+     *    queue can wait until our clock has passed their timestamp before
+     *    sending. This handles clock skew between devices - if their clock
+     *    is ahead of ours, we wait longer; if behind, we can send sooner.
+     * 
+     *    This is necessary because ATAK sorts messages by the `event time`
+     *    attribute, which the TAK server sets based on when IT receives the
+     *    message. With clock skew, a fixed delay doesn't work - we need to
+     *    ensure our message arrives at the TAK server AFTER their message's
+     *    timestamp.
      * 
      * @param callsign The sender's callsign
      * @param their_timestamp ISO8601 timestamp from their message
      */
-    void updateClockOffset(const std::string& callsign, const std::string& their_timestamp)
+    void recordIncomingMessage(const std::string& callsign, const std::string& their_timestamp)
     {
         // Parse their timestamp to get seconds since epoch
         double their_time_seconds = parseISOTimestamp(their_timestamp);
-        if (their_time_seconds < 0) {
-            RCLCPP_WARN(this->get_logger(),
-                "[ClockOffset] Failed to parse timestamp from %s: %s",
+        
+        // Record their timestamp for proper response timestamp calculation
+        {
+            std::lock_guard<std::mutex> lock(last_incoming_mutex_);
+            
+            LastIncomingMessage msg;
+            msg.timestamp = their_timestamp;
+            msg.received_at = std::chrono::steady_clock::now();
+            
+            last_incoming_messages_[callsign] = msg;
+            
+            RCLCPP_DEBUG(this->get_logger(),
+                "[Timestamp] Recorded message from %s at %s",
                 callsign.c_str(), their_timestamp.c_str());
-            return;
         }
         
-        // Get our current time in seconds since epoch
-        auto now = std::chrono::system_clock::now();
-        double our_time_seconds = std::chrono::duration<double>(
-            now.time_since_epoch()).count();
-        
-        // Calculate offset: positive means their clock is behind
-        double new_offset = our_time_seconds - their_time_seconds;
-        
-        std::lock_guard<std::mutex> lock(clock_offsets_mutex_);
-        
-        auto it = clock_offsets_.find(callsign);
-        if (it == clock_offsets_.end()) {
-            // First message from this callsign
-            ClockOffset offset;
-            offset.offset_seconds = new_offset;
-            offset.last_updated = std::chrono::steady_clock::now();
-            offset.sample_count = 1;
-            clock_offsets_[callsign] = offset;
+        // CRITICAL: Store their parsed timestamp for reply delay enforcement
+        // The send queue will wait until our clock passes their_time + buffer
+        // before sending any reply. This handles clock skew automatically:
+        // - If their clock is ahead: we wait longer
+        // - If their clock is behind: we can send sooner
+        //
+        // SAFETY CAP: We never wait more than MAX_REPLY_WAIT_S to handle cases
+        // where a device's clock is wildly off (hours/days ahead).
+        {
+            std::lock_guard<std::mutex> lock(send_queue_mutex_);
             
-            RCLCPP_INFO(this->get_logger(),
-                "[ClockOffset] NEW %s: %.2fs (their clock is %s)",
-                callsign.c_str(), new_offset,
-                new_offset > 0 ? "behind" : "ahead");
-        } else {
-            // Update with exponential moving average (alpha = 0.3)
-            // This smooths out network latency jitter
-            const double alpha = 0.3;
-            double old_offset = it->second.offset_seconds;
-            it->second.offset_seconds = alpha * new_offset + (1.0 - alpha) * old_offset;
-            it->second.last_updated = std::chrono::steady_clock::now();
-            it->second.sample_count++;
+            auto now = std::chrono::system_clock::now();
+            double current_time = std::chrono::duration<double>(
+                now.time_since_epoch()).count();
             
-            // Only log if offset changed significantly (>1 second)
-            if (std::abs(it->second.offset_seconds - old_offset) > 1.0) {
-                RCLCPP_INFO(this->get_logger(),
-                    "[ClockOffset] UPDATED %s: %.2fs -> %.2fs",
-                    callsign.c_str(), old_offset, it->second.offset_seconds);
+            if (their_time_seconds > 0) {
+                // Calculate when we'd ideally reply (their time + small buffer)
+                double ideal_reply_time = their_time_seconds + reply_delay_s_;
+                
+                // Calculate the maximum time we're willing to wait
+                double max_reply_time = current_time + MAX_REPLY_WAIT_S;
+                
+                // Use the earlier of the two (cap the wait time)
+                double earliest_reply_time = std::min(ideal_reply_time, max_reply_time);
+                earliest_reply_time_per_dest_[callsign] = earliest_reply_time;
+                
+                // Calculate how long we'll wait from now (for logging)
+                double wait_time = earliest_reply_time - current_time;
+                
+                if (ideal_reply_time > max_reply_time) {
+                    // Clock skew is large - we're capping the wait
+                    RCLCPP_WARN(this->get_logger(),
+                        "[Reply Delay] Their clock is %.1fs ahead! Capping wait to %.1fs for %s",
+                        (their_time_seconds - current_time), MAX_REPLY_WAIT_S, callsign.c_str());
+                } else if (wait_time > 0) {
+                    RCLCPP_INFO(this->get_logger(),
+                        "[Reply Delay] Will wait %.1fs before sending to %s (their clock is %.1fs ahead)",
+                        wait_time, callsign.c_str(), (their_time_seconds - current_time));
+                } else {
+                    RCLCPP_INFO(this->get_logger(),
+                        "[Reply Delay] Can send to %s immediately (their clock is %.1fs behind)",
+                        callsign.c_str(), (current_time - their_time_seconds));
+                }
+            } else {
+                // Failed to parse their timestamp - fall back to current time + small delay
+                earliest_reply_time_per_dest_[callsign] = current_time + reply_delay_s_;
+                
+                RCLCPP_WARN(this->get_logger(),
+                    "[Reply Delay] Could not parse timestamp from %s, using fixed %.1fs delay",
+                    callsign.c_str(), reply_delay_s_);
             }
         }
     }
     
     /**
-     * @brief Get the clock offset for a callsign.
+     * @brief Get the appropriate timestamp for replying to a callsign.
      * 
-     * @param callsign The callsign to look up
-     * @return The offset in seconds (positive = their clock behind), or 0.0 if unknown
+     * RESPONSE ORDERING LOGIC:
+     * ------------------------
+     * To ensure our reply appears AFTER their message in ATAK's chat, we use
+     * the MAXIMUM of two candidate timestamps:
+     * 
+     *   1. their_timestamp + RESPONSE_DELAY_S  (relative to their message)
+     *   2. current_time + CURRENT_TIME_BUFFER_S (relative to now)
+     * 
+     * This dual approach handles CLOCK SKEW between devices:
+     *   - If their clock is behind ours: (1) might be in our past, so we use (2)
+     *   - If their clock is ahead of ours: (1) ensures we're after their message
+     * 
+     * CRITICAL: After calculating a response timestamp, we UPDATE the stored
+     * timestamp to the response value. This ensures that if we send MULTIPLE
+     * messages in quick succession, each one gets a progressively LATER timestamp.
+     * 
+     * STALENESS CHECKS:
+     * -----------------
+     * We consider a stored timestamp "stale" if it was received more than 5
+     * minutes ago. After that, we only use current time.
+     * 
+     * @param destination The callsign we're replying to
+     * @return ISO8601 timestamp to use for our outgoing message
      */
-    double getClockOffset(const std::string& callsign)
+    std::string getResponseTimestamp(const std::string& destination)
     {
-        std::lock_guard<std::mutex> lock(clock_offsets_mutex_);
+        std::lock_guard<std::mutex> lock(last_incoming_mutex_);
         
-        auto it = clock_offsets_.find(callsign);
-        if (it == clock_offsets_.end()) {
-            return 0.0;  // No offset known, use our clock
-        }
+        // Get current time - we'll need this regardless
+        auto now = std::chrono::system_clock::now();
+        double current_time_seconds = std::chrono::duration<double>(
+            now.time_since_epoch()).count();
         
-        // Check if offset is stale (older than 1 hour)
-        // Clocks can drift, so old offsets may be inaccurate
-        auto age = std::chrono::steady_clock::now() - it->second.last_updated;
-        if (age > std::chrono::hours(1)) {
+        auto it = last_incoming_messages_.find(destination);
+        
+        if (it == last_incoming_messages_.end()) {
+            // No recorded message from this destination - use current time + buffer
+            double response_time = current_time_seconds + CURRENT_TIME_BUFFER_S;
+            std::string response_timestamp = secondsToISO(response_time);
             RCLCPP_DEBUG(this->get_logger(),
-                "[ClockOffset] Offset for %s is stale (%.1f hours old), using 0",
-                callsign.c_str(), 
-                std::chrono::duration<double, std::ratio<3600>>(age).count());
-            return 0.0;
+                "[Timestamp] No record for %s, using current time + buffer = %s",
+                destination.c_str(), response_timestamp.c_str());
+            return response_timestamp;
         }
         
-        return it->second.offset_seconds;
+        // Check if the record is stale (received more than 5 minutes ago)
+        auto age = std::chrono::steady_clock::now() - it->second.received_at;
+        if (age > std::chrono::minutes(5)) {
+            double response_time = current_time_seconds + CURRENT_TIME_BUFFER_S;
+            std::string response_timestamp = secondsToISO(response_time);
+            RCLCPP_DEBUG(this->get_logger(),
+                "[Timestamp] Record from %s is stale (%.1f min), using current time + buffer = %s",
+                destination.c_str(),
+                std::chrono::duration<double, std::ratio<60>>(age).count(),
+                response_timestamp.c_str());
+            return response_timestamp;
+        }
+        
+        // Parse their stored timestamp
+        double their_time_seconds = parseISOTimestamp(it->second.timestamp);
+        if (their_time_seconds < 0) {
+            double response_time = current_time_seconds + CURRENT_TIME_BUFFER_S;
+            std::string response_timestamp = secondsToISO(response_time);
+            RCLCPP_WARN(this->get_logger(),
+                "[Timestamp] Failed to parse timestamp from %s, using current time + buffer = %s",
+                destination.c_str(), response_timestamp.c_str());
+            return response_timestamp;
+        }
+        
+        // Calculate both candidate timestamps
+        double candidate_from_their_time = their_time_seconds + RESPONSE_DELAY_S;
+        double candidate_from_current_time = current_time_seconds + CURRENT_TIME_BUFFER_S;
+        
+        // Use the MAXIMUM to handle clock skew in either direction
+        double response_time_seconds = std::max(candidate_from_their_time, candidate_from_current_time);
+        
+        // Convert back to ISO format
+        std::string response_timestamp = secondsToISO(response_time_seconds);
+        
+        // Log which timestamp we chose
+        if (candidate_from_their_time >= candidate_from_current_time) {
+            RCLCPP_INFO(this->get_logger(),
+                "[Timestamp] Reply to %s: using their_time + delay = %s (their=%s + %.1fs)",
+                destination.c_str(), response_timestamp.c_str(),
+                it->second.timestamp.c_str(), RESPONSE_DELAY_S);
+        } else {
+            RCLCPP_INFO(this->get_logger(),
+                "[Timestamp] Reply to %s: using current_time + buffer = %s (clock skew detected: their_time was %.1fs behind)",
+                destination.c_str(), response_timestamp.c_str(),
+                current_time_seconds - their_time_seconds);
+        }
+        
+        // CRITICAL: Update the stored timestamp to be our response timestamp
+        // This ensures that the NEXT message to this destination will have
+        // a timestamp AFTER this one, maintaining proper ordering
+        it->second.timestamp = response_timestamp;
+        // Don't reset received_at - we want staleness based on original incoming message
+        
+        return response_timestamp;
     }
     
     /**
@@ -1082,38 +1451,41 @@ private:
     /**
      * @brief Build a GeoChat CoT XML message.
      * 
-     * The timestamp is adjusted based on the clock offset for the destination
-     * callsign. This ensures messages appear in correct chronological order
-     * on their device, even if their clock is drifting.
+     * The timestamp should already be correctly adjusted by the caller using
+     * getResponseTimestamp() to ensure proper message ordering in ATAK.
+     * 
+     * UID OVERRIDE SUPPORT:
+     * ---------------------
+     * The override_uid parameter uses the format: "event_uid|message_id"
+     * 
+     * This allows independent control of each identifier:
+     *   - "uuid1|uuid2" → Event UID uses uuid1, messageId uses uuid2
+     *   - "uuid1|"      → Event UID uses uuid1, messageId is random
+     *   - "|uuid2"      → Event UID is random, messageId uses uuid2
+     *   - "uuid1"       → Both use uuid1 (legacy, backward compatible)
+     *   - ""            → Both random (default)
+     * 
+     * This enables testing which identifier ATAK uses as the primary key:
+     *   /reuse-both  → Tests if matching both IDs causes overwrites
+     *   /reuse-event → Tests if only event UID matters
+     *   /reuse-msgid → Tests if only messageId matters
      * 
      * @param sender This robot's callsign
      * @param destination Target callsign
      * @param message The chat message text
-     * @param base_timestamp Our timestamp (from nowISO())
+     * @param timestamp The timestamp to use (already adjusted for ordering)
+     * @param override_uid Encoded as "event_uid|message_id"
      * @return Complete CoT XML string
      */
     std::string buildGeoChatCoT(const std::string& sender,
                                 const std::string& destination,
                                 const std::string& message,
-                                const std::string& base_timestamp)
+                                const std::string& timestamp,
+                                const std::string& override_uid = "")
     {
-        // Adjust timestamp based on clock offset for this destination
-        // If their clock is behind, we subtract from our time so messages
-        // appear in correct order on their device
-        double offset = getClockOffset(destination);
-        std::string adjusted_timestamp = base_timestamp;
+        const std::string time_now = timestamp;
         
-        if (std::abs(offset) > 1.0) {  // Only adjust if offset > 1 second
-            adjusted_timestamp = adjustTimestamp(base_timestamp, -offset);
-            RCLCPP_DEBUG(this->get_logger(),
-                "[TakChat] Adjusted timestamp for %s: %s -> %s (offset: %.1fs)",
-                destination.c_str(), base_timestamp.c_str(), 
-                adjusted_timestamp.c_str(), offset);
-        }
-        
-        const std::string time_now = adjusted_timestamp;
-        
-        // Stale time is calculated from NOW (not adjusted timestamp)
+        // Stale time is calculated from actual current time
         // This ensures the message doesn't expire prematurely
         const std::string time_stale = futureISO(60);
 
@@ -1124,9 +1496,43 @@ private:
             lon = current_lon_;
         }
 
-        const std::string uid = std::string("GeoChat.") + sender +
-                                ".ANDROID-" + android_id_ + "." + randUUID();
-        const std::string chat_id = randUUID();
+        // Parse override_uid field: "event_uid|message_id"
+        // This allows independent control of each identifier for testing
+        std::string event_uid_override;
+        std::string message_id_override;
+        
+        if (!override_uid.empty()) {
+            size_t separator_pos = override_uid.find('|');
+            if (separator_pos != std::string::npos) {
+                // Format: "event_uid|message_id"
+                event_uid_override = override_uid.substr(0, separator_pos);
+                message_id_override = override_uid.substr(separator_pos + 1);
+            } else {
+                // Legacy format: use same value for both (backward compatible)
+                event_uid_override = override_uid;
+                message_id_override = override_uid;
+            }
+        }
+        
+        // Generate UID - use override if provided, otherwise generate random
+        std::string uid;
+        std::string chat_id;
+        
+        if (!event_uid_override.empty()) {
+            // Use the provided event UID
+            uid = std::string("GeoChat.") + sender + ".ANDROID-" + android_id_ + "." + event_uid_override;
+        } else {
+            // Generate random event UID (normal operation)
+            uid = std::string("GeoChat.") + sender + ".ANDROID-" + android_id_ + "." + randUUID();
+        }
+        
+        if (!message_id_override.empty()) {
+            // Use the provided messageId
+            chat_id = message_id_override;
+        } else {
+            // Generate random messageId (normal operation)
+            chat_id = randUUID();
+        }
 
         std::ostringstream xml;
         
@@ -1141,7 +1547,6 @@ private:
 
         xml << "<detail>";
         
-        // Flow tag uses the original timestamp for consistency
         xml << "<_flow_tags_ " << tak_server_flow_tag_key_ << "=\"" << time_now << "\"/>";
 
         xml << "<__chat parent=\"RootContactGroup\" groupOwner=\"false\""
@@ -1217,27 +1622,15 @@ private:
     }
     
     /**
-     * @brief Adjust an ISO8601 timestamp by a number of seconds.
+     * @brief Convert seconds since epoch to ISO8601 timestamp string.
      * 
-     * Used to apply clock offset when sending to callsigns with drifting clocks.
-     * 
-     * @param iso_timestamp The original timestamp (e.g., "2026-01-08T15:00:34.114Z")
-     * @param adjustment_seconds Seconds to add (negative to subtract)
-     * @return Adjusted timestamp in ISO8601 format
+     * @param seconds_since_epoch Time in seconds since Unix epoch (UTC)
+     * @return ISO8601 formatted timestamp (e.g., "2026-01-08T15:00:34.114000Z")
      */
-    std::string adjustTimestamp(const std::string& iso_timestamp, double adjustment_seconds)
+    std::string secondsToISO(double seconds_since_epoch)
     {
-        // Parse the timestamp
-        double seconds_since_epoch = parseISOTimestamp(iso_timestamp);
-        if (seconds_since_epoch < 0) {
-            return iso_timestamp;  // Parse failed, return original
-        }
-        
-        // Apply adjustment
-        seconds_since_epoch += adjustment_seconds;
-        
-        // Convert back to ISO format
         using namespace std::chrono;
+        
         auto tp = system_clock::time_point(
             duration_cast<system_clock::duration>(
                 duration<double>(seconds_since_epoch)));
@@ -1284,44 +1677,78 @@ private:
     // Member Variables
     //==========================================================================
     
+    // --- Identity ---
     std::string callsign_;
     std::string android_id_;
     std::string tak_server_flow_tag_key_;
     
+    // --- Allowed callsigns (for filtering incoming messages) ---
     std::vector<std::string> allowed_callsigns_;
     std::set<std::string> allowed_callsigns_set_;
     
+    // --- Retry/timing configuration ---
     double retry_timeout_s_;
     double retry_interval_s_;
     int min_retry_count_;
-    double send_delay_s_;
+    double send_delay_s_;      // Min delay between consecutive sends to same dest
+    double reply_delay_s_;     // Min delay after receiving before sending reply
 
+    // --- GPS position ---
     std::mutex fix_mtx_;
     bool fix_received_;
     double current_lat_;
     double current_lon_;
 
-    // Send queue - messages wait here before being sent
-    std::queue<QueuedMessage> send_queue_;
-    std::mutex send_queue_mutex_;
-    std::chrono::steady_clock::time_point last_send_time_;
+    // --- Comms status (base_station connectivity) ---
+    // Tracks whether we can reach the base_station (TAK server) via the mesh network
+    // All TAK/ATAK messages go through base_station, so this is a binary check
+    std::mutex comms_mutex_;
+    bool comms_status_received_{false};     // Have we ever received comms_status?
+    bool has_base_station_comms_{false};    // Is base_station in transitive list?
 
-    // Pending messages - for retry tracking after sending
+    // --- Send queue (ensures delay between messages to SAME destination) ---
+    std::deque<QueuedMessage> send_queue_;
+    std::mutex send_queue_mutex_;
+    // Track last send time PER DESTINATION - allows simultaneous sends to different destinations
+    std::map<std::string, std::chrono::steady_clock::time_point> last_send_time_per_dest_;
+    // Track earliest reply time per destination (wall-clock seconds since epoch)
+    // This handles clock skew - we wait until our clock passes their timestamp + buffer
+    std::map<std::string, double> earliest_reply_time_per_dest_;
+
+    // --- Pending messages (for retry tracking) ---
     std::map<std::string, PendingMessage> pending_messages_;
     std::mutex pending_mutex_;
     
-    // Clock offsets - tracks time difference per callsign for proper message ordering
-    // Key: callsign, Value: ClockOffset with offset_seconds = our_time - their_time
-    std::map<std::string, ClockOffset> clock_offsets_;
-    std::mutex clock_offsets_mutex_;
+    // --- Last incoming message per callsign (for proper response ordering) ---
+    // When replying to someone, we use their timestamp + delay to ensure our
+    // response appears AFTER their message in ATAK's chat view
+    std::map<std::string, LastIncomingMessage> last_incoming_messages_;
+    std::mutex last_incoming_mutex_;
+    
+    // Minimum delay (seconds) to add to incoming timestamp when replying.
+    // Must be large enough to account for network latency + processing time.
+    static constexpr double RESPONSE_DELAY_S = 2.0;
+    
+    // Buffer (seconds) to add to current time when using current-time-based timestamp.
+    // This handles cases where their clock is behind ours.
+    static constexpr double CURRENT_TIME_BUFFER_S = 0.5;
+    
+    // Maximum time (seconds) to wait before replying, regardless of clock skew.
+    // This prevents excessive delays if a device's clock is wildly off (hours/days ahead).
+    // Set to a reasonable value that handles typical clock drift but caps extreme cases.
+    static constexpr double MAX_REPLY_WAIT_S = 5.0;
 
+    // --- Publishers ---
     rclcpp::Publisher<std_msgs::msg::String>::SharedPtr pub_cot_;
     rclcpp::Publisher<tak_chat::msg::TakChat>::SharedPtr pub_tak_chat_in_;
 
+    // --- Subscribers ---
     rclcpp::Subscription<sensor_msgs::msg::NavSatFix>::SharedPtr sub_navsat_;
     rclcpp::Subscription<tak_chat::msg::TakChat>::SharedPtr sub_tak_chat_out_;
     rclcpp::Subscription<std_msgs::msg::String>::SharedPtr sub_incoming_cot_;
+    rclcpp::Subscription<west_point_comms_sim::msg::CommsStatus>::SharedPtr sub_comms_status_;
 
+    // --- Timers ---
     rclcpp::TimerBase::SharedPtr retry_timer_;
     rclcpp::TimerBase::SharedPtr send_queue_timer_;
 };

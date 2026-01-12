@@ -17,6 +17,7 @@ find_package(rclcpp REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(rosidl_default_generators REQUIRED)
+find_package(west_point_comms_sim REQUIRED)
 
 # =============================================================================
 # Generate Custom Messages
@@ -44,6 +45,7 @@ ament_target_dependencies(tak_chat_node
   rclcpp
   std_msgs
   sensor_msgs
+  west_point_comms_sim
 )
 
 # Link to generated messages from this package
@@ -82,7 +84,7 @@ install(PROGRAMS
 # Export for other packages
 # =============================================================================
 ament_export_include_directories(include)
-ament_export_dependencies(rosidl_default_runtime rclcpp std_msgs sensor_msgs)
+ament_export_dependencies(rosidl_default_runtime rclcpp std_msgs sensor_msgs west_point_comms_sim)
 
 # =============================================================================
 # Testing (optional)
