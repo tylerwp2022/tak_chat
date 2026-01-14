@@ -222,7 +222,7 @@ public:
         
         // Send queue parameters - ensures messages have distinct timestamps
         this->declare_parameter<double>("send_delay_s", 1.0);         // Min delay between sends to same dest
-        this->declare_parameter<double>("reply_delay_s", 0.5);        // Buffer added to their timestamp before replying
+        this->declare_parameter<double>("reply_delay_s", 1.0);        // Buffer added to their timestamp before replying
 
         //----------------------------------------------------------------------
         // Read Parameters
