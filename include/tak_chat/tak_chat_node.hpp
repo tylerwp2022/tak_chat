@@ -1032,8 +1032,29 @@ private:
             return;
         }
 
-        // Ignore our own messages
+        // Ignore our own messages (echo from the TAK bridge reflecting our sends)
         if (sender == callsign_) {
+            return;
+        }
+
+        // Gate on base_station connectivity.
+        //
+        // WHY: All TAK messages — both outgoing and incoming — travel through
+        // the base_station (TAK server).  If we can't reach the base_station we
+        // aren't really "receiving" a live message; we're seeing a stale relay
+        // or a simulator artifact.  Dropping it here prevents the BT tree from
+        // acting on information it shouldn't have while comm-denied, and keeps
+        // last_incoming_messages_ / earliest_reply_time_per_dest_ clean so that
+        // reply ordering logic doesn't get confused by a gap in connectivity.
+        //
+        // NOTE: If comms_sim is not running, hasComms() defaults to true, so
+        // this guard is a no-op in bench-test environments.
+        if (!hasComms()) {
+            RCLCPP_WARN(this->get_logger(),
+                "[TakChat IN] SUPPRESSED — no comms to base_station | "
+                "from: '%s' | msg: '%s' | status: %s",
+                sender.c_str(), message.c_str(),
+                getCommsStatusString().c_str());
             return;
         }
 
