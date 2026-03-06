@@ -2,76 +2,59 @@
 #define TAK_CHAT_NODE_HPP
 
 //==============================================================================
-// TakChatNode — Dedicated ROS2 node for TAK/ATAK chat communication
+// tak_chat_node.hpp — ROS2 node bridging TakChat messages to TAK CoT XML
 //==============================================================================
 //
-// WHAT THIS NODE DOES
-// -------------------
-// This node is the "bridge adapter" between:
+// PURPOSE:
+// --------
+// Bridges between simple ROS2 TakChat messages (from BT nodes) and the
+// TAK CoT GeoChat XML format required by the TAK server / ATAK clients.
 //
-//   1) ROS2 TakChat messages (simple: origin, destination, message, timestamp)
-//   2) TAK CoT GeoChat XML (std_msgs/String) sent to your TAK bridge pipeline
+// SUPPORTED CHAT TYPES (outgoing):
+// ---------------------------------
+//   "unicast"        — Direct message to one callsign via <marti> routing
+//   "group"          — Named group with explicit member list + hierarchy
+//   "team_color"     — TAK team color broadcast (e.g. "Cyan", "Red")
+//   "role"           — TAK role broadcast (e.g. "HQ", "Medic")
+//   "all_chat_rooms" — Broadcast to All Chat Rooms
+//   "all_groups"     — Broadcast to all Groups (UserGroups)
+//   "all_teams"      — Broadcast to all Teams (TeamGroups)
 //
-// KEY FEATURES
-// ------------
-//   - BROADCAST SUPPORT: Destination "ALL" automatically fans out to all
-//     allowed callsigns configured in cot_runner.yaml
+// BACKWARD COMPATIBILITY:
+// -----------------------
+//   Empty chat_type is treated as "unicast".
+//   destination="ALL" triggers legacy fan-out to all allowed callsigns.
+//   This preserves behavior for existing trees using BroadcastToTAK /
+//   SendTAKMessage / old ConstructTAKChatMessage nodes.
 //
-//   - INCOMING FILTERING: Only messages from allowed callsigns are forwarded
-//     to tak_chat/in. Messages from unknown senders are ignored.
+// INCOMING PARSING:
+// -----------------
+//   All incoming b-t-f CoT from allowed senders is parsed and forwarded
+//   to tak_chat/in with chat_type, chatroom, chatroom_id populated.
+//   TAK server handles group membership routing — if we receive it,
+//   we forward it. No local membership tracking needed.
 //
-//   - RELIABLE DELIVERY: Implements retry logic that continues publishing
-//     until either a subscriber is confirmed and sufficient retries have
-//     occurred, or the timeout is reached. This handles DDS discovery races.
+// MESSAGE FLOW:
+// -------------
+//   OUTGOING: BT node → tak_chat/out → TakChatNode → CoT XML → send_to_tak
+//   INCOMING: incoming_cot → TakChatNode → parse → tak_chat/in → BT node
 //
-//   - SEND QUEUE WITH DELAY: Messages are queued and sent one at a time with
-//     a minimum delay between them (default 1 second). This ensures each
-//     message has a distinct timestamp so TAK/ATAK can properly order them.
-//
-//   - COMMS-AWARE DELIVERY: Integrates with west_point_comms_sim to only send
-//     messages to destinations that are reachable via the mesh network.
-//     Messages to unreachable destinations are suppressed with a warning.
-//     If comms_status is not published, defaults to allowing all destinations.
-//
-//   - UID OVERRIDE (for testing): If the TakChat message includes a non-empty
-//     'uid' field, that UID will be used for both the event UID and the __chat
-//     messageId in the CoT XML instead of generating random values. This allows
-//     testing whether ATAK treats messages with identical UIDs+messageIds as
-//     updates/replacements.
-//
-// MESSAGE FLOW
-// ------------
-//   A) OUTGOING (ROS -> TAK)
-//      - BT nodes publish TakChat requests to tak_chat/out
-//      - If destination is "ALL", fans out to all allowed callsigns
-//      - Each destination is checked against comms_status transitive list
-//      - Messages to unreachable destinations are suppressed
-//      - Reachable messages are queued and sent with delay between them
-//      - Timestamp is generated when actually sent (not when received)
-//      - If TakChat.uid is non-empty, uses that UID; otherwise generates random
-//      - Publishes to send_to_tak with retry logic
-//
-//   B) INCOMING (TAK -> ROS)
-//      - TAK bridge publishes incoming CoT XML to incoming_cot
-//      - Parses GeoChat messages and checks if sender is in allowed list
-//      - Only forwards messages from allowed callsigns to tak_chat/in
-//
-// CONFIGURATION (ROS Parameters)
-// ------------------------------
-//   callsign:               This robot's identity (default: "warthog1")
-//   android_id:             Used for ATAK UID format
-//   tak_server_flow_tag_key: TAK server session key
-//   outgoing_cot_topic:     Where to publish CoT XML (default: "send_to_tak")
-//   incoming_cot_topic:     Where to receive CoT XML (default: "incoming_cot")
-//   navsat_topic:           GPS source for location (default: "navsat")
-//   tak_chat_out_topic:     Incoming requests from BT (default: "tak_chat/out")
-//   tak_chat_in_topic:      Outgoing events to BT (default: "tak_chat/in")
-//   comms_topic:            Mesh connectivity status (default: "comms")
-//   allowed_callsigns_file: Path to YAML with allowed callsigns
-//   send_delay_s:           Min delay between sends (default: 1.0)
-//   retry_timeout_s:        Total time to keep retrying (default: 10.0)
-//   retry_interval_s:       Interval between retries (default: 1.0)
-//   min_retry_count:        Minimum retries even with subscriber (default: 2)
+// CONFIGURATION (ROS Parameters):
+// --------------------------------
+//   callsign                 Robot callsign (default: "warthog1")
+//   tak_server_flow_tag_key  TAK server session key
+//   outgoing_cot_topic       Where to publish CoT XML (default: "send_to_tak")
+//   incoming_cot_topic       Where to receive CoT XML (default: "incoming_cot")
+//   navsat_topic             GPS source (default: "navsat")
+//   tak_chat_out_topic       Requests from BT (default: "tak_chat/out")
+//   tak_chat_in_topic        Events to BT (default: "tak_chat/in")
+//   comms_topic              Mesh connectivity (default: "comms")
+//   allowed_callsigns_file   Path to YAML with allowed callsigns
+//   send_delay_s             Min delay between sends to same dest (default: 1.0)
+//   retry_timeout_s          Total retry window (default: 10.0)
+//   retry_interval_s         Interval between retries (default: 1.0)
+//   min_retry_count          Min publishes even with subscriber (default: 1)
+//   reply_delay_s            Buffer added to their timestamp (default: 1.0)
 //
 //==============================================================================
 
@@ -79,8 +62,6 @@
 #include <std_msgs/msg/string.hpp>
 #include <sensor_msgs/msg/nav_sat_fix.hpp>
 #include <tak_chat/msg/tak_chat.hpp>
-
-// Comms status from west_point_comms_sim
 #include <west_point_comms_sim/msg/comms_status.hpp>
 
 #include <string>
@@ -97,312 +78,289 @@
 #include <fstream>
 #include <algorithm>
 
+//==============================================================================
+// Chat type string constants
+// Used in TakChat.msg chat_type field and throughout this node.
+//==============================================================================
+namespace ChatType
+{
+    static const std::string UNICAST = "unicast";
+    static const std::string GROUP = "group";
+    static const std::string TEAM_COLOR = "team_color";
+    static const std::string ROLE = "role";
+    static const std::string ALL_CHAT_ROOMS = "all_chat_rooms";
+    static const std::string ALL_GROUPS = "all_groups";
+    static const std::string ALL_TEAMS = "all_teams";
+}
 
 //==============================================================================
-// Special destination for broadcast messages
+// __chat parent attribute constants
+// These are fixed TAK protocol values — do not change.
+//==============================================================================
+namespace ChatParent
+{
+    static const std::string ROOT_CONTACT_GROUP = "RootContactGroup";
+    static const std::string USER_GROUPS = "UserGroups";
+    static const std::string TEAM_GROUPS = "TeamGroups";
+}
+
+//==============================================================================
+// Well-known chatroom/id constants for broadcast types
+//==============================================================================
+namespace ChatRoom
+{
+    static const std::string ALL_CHAT_ROOMS = "All Chat Rooms";
+    static const std::string ALL_GROUPS = "Groups";
+    static const std::string ALL_GROUPS_ID = "UserGroups";
+    static const std::string ALL_TEAMS = "Teams";
+    static const std::string ALL_TEAMS_ID = "TeamGroups";
+}
+
+//==============================================================================
+// Legacy broadcast destination sentinel
 //==============================================================================
 static const std::string BROADCAST_DESTINATION = "ALL";
 
+//==============================================================================
+// Internal structs
+//==============================================================================
 
-//==============================================================================
-// LastIncomingMessage - Tracks the last message received from each callsign
-//==============================================================================
-//
-// To ensure replies appear AFTER the incoming message in ATAK's chat view,
-// we track the timestamp of each callsign's last message. When we reply,
-// we use their timestamp + a delay as our outgoing timestamp.
-//
-// This is simpler and more reliable than calculating clock offsets because:
-//   1. It guarantees ordering regardless of clock drift
-//   2. It handles network latency naturally
-//   3. It works even if their clock jumps around
-//
-//==============================================================================
-struct LastIncomingMessage {
-    std::string timestamp;                              // ISO8601 timestamp from their message
-    std::chrono::steady_clock::time_point received_at;  // When we received it (for staleness check)
+/// Message waiting in the send queue before being dispatched
+struct QueuedMessage
+{
+    tak_chat::msg::TakChat tak_msg;                    // Full TakChat message
+    std::chrono::steady_clock::time_point queued_time; // When added to queue
 };
 
+/// Message being tracked for retry/delivery confirmation
+struct PendingMessage
+{
+    std::string destination;    // Target callsign (unicast) or type label
+    std::string message;        // Message text (for logging)
+    std::string send_timestamp; // Timestamp embedded in CoT
+    std::string cot_xml;        // Generated CoT XML
 
-//==============================================================================
-// QueuedMessage - Message waiting in the send queue
-//==============================================================================
-//
-// Messages are queued here first, then sent one at a time with a minimum
-// delay between them. This ensures:
-//   1. Messages have distinct, well-separated timestamps
-//   2. Messages are sent in strict FIFO order
-//   3. TAK server and ATAK can properly order messages
-//
-//==============================================================================
-struct QueuedMessage {
-    std::string destination;                // Target callsign
-    std::string message;                    // Message text
-    std::string override_uid;               // Optional: if non-empty, use this UID instead of random
-    std::chrono::steady_clock::time_point queued_time;  // When added to queue
+    std::chrono::steady_clock::time_point created_time;
+    std::chrono::steady_clock::time_point last_publish_time;
+
+    int publish_count;
+    bool subscriber_seen;
+    bool complete;
 };
 
-
-//==============================================================================
-// PendingMessage - Tracks message delivery (retry logic)
-//==============================================================================
-// 
-// After a message is sent from the queue, it moves here for retry tracking.
-// This handles DDS discovery races by retrying until delivery is confirmed.
-//
-// DELIVERY STRATEGY:
-// ------------------
-// Since we can't get true end-to-end ACKs from the TAK server, we use a
-// "belt and suspenders" approach:
-//
-//   1. Publish immediately when sent from queue
-//   2. Keep retrying at regular intervals
-//   3. Mark complete when BOTH conditions are met:
-//      a) At least one subscriber is connected to send_to_tak
-//      b) Minimum number of retries have been sent
-//   4. Continue until timeout if no subscriber ever appears
-//
-//==============================================================================
-struct PendingMessage {
-    // Message identification
-    std::string destination;                // Target callsign
-    std::string message;                    // Message text
-    std::string send_timestamp;             // Timestamp when actually sent (for CoT)
-    std::string cot_xml;                    // Generated CoT XML (with unique UID)
-    
-    // Timing
-    std::chrono::steady_clock::time_point created_time;      // When message was queued
-    std::chrono::steady_clock::time_point last_publish_time; // When last publish occurred
-    
-    // Retry tracking
-    int publish_count;                      // Total publishes so far
-    bool subscriber_seen;                   // Have we ever seen a subscriber?
-    bool complete;                          // Ready for removal from pending map
+/// Tracks the last message received from a callsign (for reply ordering)
+struct LastIncomingMessage
+{
+    std::string timestamp;
+    std::chrono::steady_clock::time_point received_at;
 };
 
-
+//==============================================================================
+// TakChatNode
+//==============================================================================
 class TakChatNode : public rclcpp::Node
 {
 public:
     //==========================================================================
-    // Constructor - Initialize node, parameters, publishers, and subscribers
+    // CONSTRUCTOR
     //==========================================================================
-    TakChatNode(const rclcpp::NodeOptions& options = rclcpp::NodeOptions())
-        : Node("tak_chat_node", options),
-          fix_received_(false),
-          current_lat_(0.0),
-          current_lon_(0.0)
+    explicit TakChatNode(const rclcpp::NodeOptions &options = rclcpp::NodeOptions())
+        : Node("tak_chat_node", options), fix_received_(false), current_lat_(0.0), current_lon_(0.0), comms_status_received_(false), has_base_station_comms_(false)
     {
         //----------------------------------------------------------------------
-        // Declare Parameters
+        // Declare parameters
         //----------------------------------------------------------------------
-        
-        // Identity parameters - how this robot identifies itself in TAK
-        this->declare_parameter<std::string>("callsign", "warthog1");
-        this->declare_parameter<std::string>("android_id", "dfac01d76beec661");
-        this->declare_parameter<std::string>("tak_server_flow_tag_key",
-            "TAK-Server-d520578543014e9cba1916fad77b9917");
-
-        // Topic configuration - where messages flow
-        this->declare_parameter<std::string>("outgoing_cot_topic", "send_to_tak");
-        this->declare_parameter<std::string>("incoming_cot_topic", "incoming_cot");
-        this->declare_parameter<std::string>("navsat_topic", "navsat");
-        this->declare_parameter<std::string>("tak_chat_out_topic", "tak_chat/out");
-        this->declare_parameter<std::string>("tak_chat_in_topic", "tak_chat/in");
-        this->declare_parameter<std::string>("comms_topic", "comms");
-
-        // Allowed callsigns configuration
-        this->declare_parameter<std::string>("allowed_callsigns_file",
-            "/phoenix/src/phoenix-tak/src/tak_bridge/config/cot_runner.yaml");
-
-        // Retry/reliability parameters - tuned for DDS discovery timing
-        this->declare_parameter<double>("retry_timeout_s", 10.0);     // Total retry window
-        this->declare_parameter<double>("retry_interval_s", 1.0);     // Time between publishes
-        this->declare_parameter<int>("min_retry_count", 1);           // Min publishes even with subscriber
-        
-        // Send queue parameters - ensures messages have distinct timestamps
-        this->declare_parameter<double>("send_delay_s", 1.0);         // Min delay between sends to same dest
-        this->declare_parameter<double>("reply_delay_s", 1.0);        // Buffer added to their timestamp before replying
+        declare_parameter<std::string>("callsign", "warthog1");
+        declare_parameter<std::string>("tak_server_flow_tag_key",
+                                       "TAK-Server-d520578543014e9cba1916fad77b9917");
+        declare_parameter<std::string>("outgoing_cot_topic", "send_to_tak");
+        declare_parameter<std::string>("incoming_cot_topic", "incoming_cot");
+        declare_parameter<std::string>("navsat_topic", "navsat");
+        declare_parameter<std::string>("tak_chat_out_topic", "tak_chat/out");
+        declare_parameter<std::string>("tak_chat_in_topic", "tak_chat/in");
+        declare_parameter<std::string>("comms_topic", "comms");
+        declare_parameter<std::string>("allowed_callsigns_file",
+                                       "/phoenix/src/phoenix-tak/src/tak_bridge/config/cot_runner.yaml");
+        declare_parameter<double>("retry_timeout_s", 10.0);
+        declare_parameter<double>("retry_interval_s", 1.0);
+        declare_parameter<int>("min_retry_count", 1);
+        declare_parameter<double>("send_delay_s", 1.0);
+        declare_parameter<double>("reply_delay_s", 1.0);
+        declare_parameter<std::vector<std::string>>("known_device_uids",
+                                                    std::vector<std::string>{});
 
         //----------------------------------------------------------------------
-        // Read Parameters
+        // Read parameters
         //----------------------------------------------------------------------
-        callsign_ = this->get_parameter("callsign").as_string();
-        android_id_ = this->get_parameter("android_id").as_string();
-        tak_server_flow_tag_key_ = this->get_parameter("tak_server_flow_tag_key").as_string();
+        callsign_ = get_parameter("callsign").as_string();
+        tak_server_flow_tag_key_ = get_parameter("tak_server_flow_tag_key").as_string();
+        retry_timeout_s_ = get_parameter("retry_timeout_s").as_double();
+        retry_interval_s_ = get_parameter("retry_interval_s").as_double();
+        min_retry_count_ = get_parameter("min_retry_count").as_int();
+        send_delay_s_ = get_parameter("send_delay_s").as_double();
+        reply_delay_s_ = get_parameter("reply_delay_s").as_double();
 
-        const std::string outgoing_cot_topic = this->get_parameter("outgoing_cot_topic").as_string();
-        const std::string incoming_cot_topic = this->get_parameter("incoming_cot_topic").as_string();
-        const std::string navsat_topic = this->get_parameter("navsat_topic").as_string();
-        const std::string tak_chat_out_topic = this->get_parameter("tak_chat_out_topic").as_string();
-        const std::string tak_chat_in_topic = this->get_parameter("tak_chat_in_topic").as_string();
-        const std::string comms_topic = this->get_parameter("comms_topic").as_string();
-        const std::string allowed_callsigns_file = this->get_parameter("allowed_callsigns_file").as_string();
-
-        retry_timeout_s_ = this->get_parameter("retry_timeout_s").as_double();
-        retry_interval_s_ = this->get_parameter("retry_interval_s").as_double();
-        min_retry_count_ = this->get_parameter("min_retry_count").as_int();
-        send_delay_s_ = this->get_parameter("send_delay_s").as_double();
-        reply_delay_s_ = this->get_parameter("reply_delay_s").as_double();
+        const auto outgoing_cot_topic = get_parameter("outgoing_cot_topic").as_string();
+        const auto incoming_cot_topic = get_parameter("incoming_cot_topic").as_string();
+        const auto navsat_topic = get_parameter("navsat_topic").as_string();
+        const auto tak_chat_out_topic = get_parameter("tak_chat_out_topic").as_string();
+        const auto tak_chat_in_topic = get_parameter("tak_chat_in_topic").as_string();
+        const auto comms_topic = get_parameter("comms_topic").as_string();
+        const auto allowed_callsigns_file = get_parameter("allowed_callsigns_file").as_string();
 
         //----------------------------------------------------------------------
-        // Load Allowed Callsigns from YAML
+        // Load allowed callsigns
         //----------------------------------------------------------------------
         allowed_callsigns_ = loadAllowedCallsigns(allowed_callsigns_file);
-        
-        // Build a set for O(1) lookup when filtering incoming messages
-        for (const auto& cs : allowed_callsigns_) {
+        for (const auto &cs : allowed_callsigns_)
+        {
             allowed_callsigns_set_.insert(cs);
         }
 
         //----------------------------------------------------------------------
-        // QoS Configuration
+        // QoS — RELIABLE + VOLATILE to match TakChatInterface and ATAK bridge
         //----------------------------------------------------------------------
-        // RELIABLE: Ensures delivery confirmation
-        // VOLATILE: Works best with Fast-DDS for both short and long-lived publishers
-        //
-        // NOTE: We use VOLATILE instead of TRANSIENT_LOCAL because:
-        //   1. Fast-DDS has issues with TRANSIENT_LOCAL for short-lived publishers
-        //   2. Long-lived publishers (BT nodes, TakChatInterface) work fine with VOLATILE
-        //   3. All publishers and subscribers MUST match durability for compatibility
-        //   4. Short-lived test scripts should use tak_chat_console.py instead
-        const auto qos_reliable = rclcpp::QoS(rclcpp::KeepLast(10))
-                          .reliable()
-                          .durability_volatile();
+        const auto qos = rclcpp::QoS(rclcpp::KeepLast(10))
+                             .reliable()
+                             .durability_volatile();
 
         //----------------------------------------------------------------------
         // Publishers
         //----------------------------------------------------------------------
-        
-        // Outgoing CoT XML -> TAK bridge pipeline
-        pub_cot_ = this->create_publisher<std_msgs::msg::String>(
-            outgoing_cot_topic, qos_reliable);
-        
-        // Parsed incoming messages -> BT nodes
-        pub_tak_chat_in_ = this->create_publisher<tak_chat::msg::TakChat>(
-            tak_chat_in_topic, qos_reliable);
+        pub_cot_ = create_publisher<std_msgs::msg::String>(
+            outgoing_cot_topic, qos);
+        pub_tak_chat_in_ = create_publisher<tak_chat::msg::TakChat>(
+            tak_chat_in_topic, qos);
 
         //----------------------------------------------------------------------
         // Subscribers
         //----------------------------------------------------------------------
-        
-        // GPS location for embedding in outgoing CoT
-        sub_navsat_ = this->create_subscription<sensor_msgs::msg::NavSatFix>(
-            navsat_topic, qos_reliable,
+        sub_navsat_ = create_subscription<sensor_msgs::msg::NavSatFix>(
+            navsat_topic, qos,
             std::bind(&TakChatNode::navsatCallback, this, std::placeholders::_1));
 
-        // Comms status from west_point_comms_sim
-        // This tells us which destinations are reachable via mesh network
-        sub_comms_status_ = this->create_subscription<west_point_comms_sim::msg::CommsStatus>(
-            comms_topic, qos_reliable,
+        sub_comms_status_ = create_subscription<west_point_comms_sim::msg::CommsStatus>(
+            comms_topic, qos,
             std::bind(&TakChatNode::commsStatusCallback, this, std::placeholders::_1));
 
-        // TakChat requests from BT nodes and test scripts
-        // We use event callbacks to log when publishers connect/disconnect
-        // This helps debug discovery timing issues with Fast-DDS
-        rclcpp::SubscriptionOptions sub_options;
-        sub_options.event_callbacks.matched_callback = 
-            [this](rclcpp::MatchedInfo& info) {
-                if (info.current_count_change > 0) {
-                    RCLCPP_INFO(this->get_logger(),
-                        "[tak_chat/out] New publisher matched! Total publishers: %zu",
-                        info.current_count);
-                } else {
-                    RCLCPP_INFO(this->get_logger(),
-                        "[tak_chat/out] Publisher unmatched. Total publishers: %zu",
-                        info.current_count);
-                }
-            };
-        sub_options.event_callbacks.incompatible_qos_callback =
-            [this](rclcpp::QOSRequestedIncompatibleQoSInfo& info) {
-                RCLCPP_WARN(this->get_logger(),
-                    "[tak_chat/out] Incompatible QoS detected! Policy: %d, count: %d",
-                    info.last_policy_kind, info.total_count);
-            };
-        
-        sub_tak_chat_out_ = this->create_subscription<tak_chat::msg::TakChat>(
-            tak_chat_out_topic, qos_reliable,
-            std::bind(&TakChatNode::takChatOutCallback, this, std::placeholders::_1),
-            sub_options);
+        // Event callbacks on tak_chat/out subscription for discovery diagnostics
+        rclcpp::SubscriptionOptions sub_opts;
+        sub_opts.event_callbacks.matched_callback =
+            [this](rclcpp::MatchedInfo &info)
+        {
+            RCLCPP_INFO(get_logger(),
+                        "[tak_chat/out] Publisher count changed: %zu", info.current_count);
+        };
+        sub_opts.event_callbacks.incompatible_qos_callback =
+            [this](rclcpp::QOSRequestedIncompatibleQoSInfo &info)
+        {
+            RCLCPP_WARN(get_logger(),
+                        "[tak_chat/out] Incompatible QoS! Policy: %d", info.last_policy_kind);
+        };
 
-        // Incoming CoT from TAK bridge
-        sub_incoming_cot_ = this->create_subscription<std_msgs::msg::String>(
-            incoming_cot_topic, qos_reliable,
+        sub_tak_chat_out_ = create_subscription<tak_chat::msg::TakChat>(
+            tak_chat_out_topic, qos,
+            std::bind(&TakChatNode::takChatOutCallback, this, std::placeholders::_1),
+            sub_opts);
+
+        sub_incoming_cot_ = create_subscription<std_msgs::msg::String>(
+            incoming_cot_topic, qos,
             std::bind(&TakChatNode::incomingCotCallback, this, std::placeholders::_1));
 
         //----------------------------------------------------------------------
         // Timers
         //----------------------------------------------------------------------
-        
-        // Retry timer - handles message retries for reliability
-        retry_timer_ = this->create_wall_timer(
+        retry_timer_ = create_wall_timer(
             std::chrono::milliseconds(100),
             std::bind(&TakChatNode::retryTimerCallback, this));
-        
-        // Send queue timer - processes queued messages with delay
-        send_queue_timer_ = this->create_wall_timer(
+
+        send_queue_timer_ = create_wall_timer(
             std::chrono::milliseconds(100),
             std::bind(&TakChatNode::sendQueueTimerCallback, this));
 
         //----------------------------------------------------------------------
-        // Startup Logging
+        // Startup log
         //----------------------------------------------------------------------
-        RCLCPP_INFO(this->get_logger(), "TakChatNode initialized:");
-        RCLCPP_INFO(this->get_logger(), "  Callsign:             %s", callsign_.c_str());
-        RCLCPP_INFO(this->get_logger(), "  TakChat OUT topic:    %s", tak_chat_out_topic.c_str());
-        RCLCPP_INFO(this->get_logger(), "  TakChat IN topic:     %s", tak_chat_in_topic.c_str());
-        RCLCPP_INFO(this->get_logger(), "  Outgoing CoT topic:   %s", outgoing_cot_topic.c_str());
-        RCLCPP_INFO(this->get_logger(), "  Incoming CoT topic:   %s", incoming_cot_topic.c_str());
-        RCLCPP_INFO(this->get_logger(), "  Comms topic:          %s", comms_topic.c_str());
-        RCLCPP_INFO(this->get_logger(), "  Send delay:           %.1fs (between consecutive messages)", send_delay_s_);
-        RCLCPP_INFO(this->get_logger(), "  Reply delay:          %.1fs (buffer added to their timestamp)", reply_delay_s_);
-        RCLCPP_INFO(this->get_logger(), "  Retry timeout:        %.1fs", retry_timeout_s_);
-        RCLCPP_INFO(this->get_logger(), "  Retry interval:       %.1fs", retry_interval_s_);
-        RCLCPP_INFO(this->get_logger(), "  Min retry count:      %d", min_retry_count_);
-        RCLCPP_INFO(this->get_logger(), "  Allowed callsigns:    %zu loaded", allowed_callsigns_.size());
-        RCLCPP_INFO(this->get_logger(), "  Broadcast destination: '%s' -> fans out to all allowed",
-                    BROADCAST_DESTINATION.c_str());
-        RCLCPP_INFO(this->get_logger(), "  Comms mode:           Checking for 'base_station' in comms_status");
-        RCLCPP_INFO(this->get_logger(), "                        (if comms_sim not running, defaults to comms OK)");
-        RCLCPP_INFO(this->get_logger(), "  UID override:         Supported via TakChat.uid field (for testing)");
-        RCLCPP_INFO(this->get_logger(), "TakChatNode starting...");
+        //----------------------------------------------------------------------
+        // Pre-populate callsign → device UID map from config
+        // WHY: The map is normally learned from incoming messages, but the BT
+        // tree may send outgoing unicasts before any message has been received.
+        // Format: ["CALLSIGN:DEVICE_UID", "TRILL:ANDROID-49c8964ab97f24bc"]
+        //----------------------------------------------------------------------
+        const auto known_uids = get_parameter("known_device_uids").as_string_array();
+        for (const auto &entry : known_uids)
+        {
+            size_t sep = entry.find(':');
+            if (sep != std::string::npos)
+            {
+                const std::string cs  = entry.substr(0, sep);
+                const std::string uid = entry.substr(sep + 1);
+                callsign_to_device_uid_[cs] = uid;
+                RCLCPP_INFO(get_logger(),
+                    "[UID Map] Pre-loaded: %s → %s", cs.c_str(), uid.c_str());
+            }
+            else
+            {
+                RCLCPP_WARN(get_logger(),
+                    "[UID Map] Skipping malformed entry '%s' — expected 'CALLSIGN:DEVICE_UID'",
+                    entry.c_str());
+            }
+        }
+
+        //----------------------------------------------------------------------
+        // Startup log
+        //----------------------------------------------------------------------
+        RCLCPP_INFO(get_logger(), "TakChatNode initialized:");
+        RCLCPP_INFO(get_logger(), "  callsign:          %s", callsign_.c_str());
+        RCLCPP_INFO(get_logger(), "  outgoing CoT:      %s", outgoing_cot_topic.c_str());
+        RCLCPP_INFO(get_logger(), "  incoming CoT:      %s", incoming_cot_topic.c_str());
+        RCLCPP_INFO(get_logger(), "  tak_chat/out:      %s", tak_chat_out_topic.c_str());
+        RCLCPP_INFO(get_logger(), "  tak_chat/in:       %s", tak_chat_in_topic.c_str());
+        RCLCPP_INFO(get_logger(), "  allowed callsigns: %zu", allowed_callsigns_.size());
+        RCLCPP_INFO(get_logger(), "  send_delay_s:      %.1f", send_delay_s_);
+        RCLCPP_INFO(get_logger(), "  retry_timeout_s:   %.1f", retry_timeout_s_);
+        RCLCPP_INFO(get_logger(), "  min_retry_count:   %d", min_retry_count_);
+        RCLCPP_INFO(get_logger(), "  known UIDs:        %zu pre-loaded", callsign_to_device_uid_.size());
     }
 
 private:
     //==========================================================================
-    // YAML Parsing - Load Allowed Callsigns
+    // SECTION: YAML LOADING
     //==========================================================================
-    
-    /**
-     * @brief Load allowed callsigns from cot_runner.yaml configuration file.
-     */
-    std::vector<std::string> loadAllowedCallsigns(const std::string& yaml_path)
+
+    std::vector<std::string> loadAllowedCallsigns(const std::string &yaml_path)
     {
         std::vector<std::string> callsigns;
         std::ifstream file(yaml_path);
-        
-        if (!file.is_open()) {
-            RCLCPP_ERROR(this->get_logger(), 
-                "Could not open allowed callsigns file: %s", yaml_path.c_str());
+
+        if (!file.is_open())
+        {
+            RCLCPP_ERROR(get_logger(),
+                         "Could not open allowed callsigns file: %s", yaml_path.c_str());
             return callsigns;
         }
-        
+
         std::string line;
         bool in_allowed_section = false;
-        
-        while (std::getline(file, line)) {
-            if (line.find("allowed:") != std::string::npos) {
+
+        while (std::getline(file, line))
+        {
+            if (line.find("allowed:") != std::string::npos)
+            {
                 in_allowed_section = true;
-                if (line.find('[') != std::string::npos && 
-                    line.find(']') != std::string::npos) {
+                if (line.find('[') != std::string::npos &&
+                    line.find(']') != std::string::npos)
+                {
                     extractCallsignsFromLine(line, callsigns);
                     in_allowed_section = false;
                 }
                 continue;
             }
-            
-            if (in_allowed_section) {
-                if (line.find(']') != std::string::npos) {
+
+            if (in_allowed_section)
+            {
+                if (line.find(']') != std::string::npos)
+                {
                     extractCallsignsFromLine(line, callsigns);
                     in_allowed_section = false;
                     continue;
@@ -410,467 +368,354 @@ private:
                 extractCallsignsFromLine(line, callsigns);
             }
         }
-        
-        file.close();
-        
-        std::string callsign_list;
-        for (size_t i = 0; i < callsigns.size(); i++) {
-            callsign_list += callsigns[i];
-            if (i < callsigns.size() - 1) callsign_list += ", ";
+
+        std::string list;
+        for (size_t i = 0; i < callsigns.size(); ++i)
+        {
+            list += callsigns[i];
+            if (i + 1 < callsigns.size())
+                list += ", ";
         }
-        RCLCPP_INFO(this->get_logger(), "Loaded allowed callsigns: %s", callsign_list.c_str());
-        
+        RCLCPP_INFO(get_logger(), "Allowed callsigns: [%s]", list.c_str());
         return callsigns;
     }
-    
-    void extractCallsignsFromLine(const std::string& line, std::vector<std::string>& callsigns)
+
+    void extractCallsignsFromLine(const std::string &line,
+                                  std::vector<std::string> &out)
     {
         size_t pos = 0;
-        while ((pos = line.find('"', pos)) != std::string::npos) {
+        while ((pos = line.find('"', pos)) != std::string::npos)
+        {
             size_t end = line.find('"', pos + 1);
-            if (end != std::string::npos) {
-                std::string callsign = line.substr(pos + 1, end - pos - 1);
-                if (!callsign.empty()) {
-                    callsigns.push_back(callsign);
-                }
-                pos = end + 1;
-            } else {
+            if (end == std::string::npos)
                 break;
-            }
+            std::string cs = line.substr(pos + 1, end - pos - 1);
+            if (!cs.empty())
+                out.push_back(cs);
+            pos = end + 1;
         }
     }
 
     //==========================================================================
-    // Callback: NavSatFix - Update current GPS position
+    // SECTION: SUBSCRIBER CALLBACKS
     //==========================================================================
-    
+
+    // -------------------------------------------------------------------------
+    // GPS
+    // -------------------------------------------------------------------------
     void navsatCallback(const sensor_msgs::msg::NavSatFix::SharedPtr msg)
     {
         std::lock_guard<std::mutex> lk(fix_mtx_);
         current_lat_ = msg->latitude;
         current_lon_ = msg->longitude;
-
-        if (!fix_received_) {
+        if (!fix_received_)
+        {
             fix_received_ = true;
-            RCLCPP_INFO(this->get_logger(), "GPS fix received (%.6f, %.6f)",
+            RCLCPP_INFO(get_logger(), "GPS fix received (%.6f, %.6f)",
                         current_lat_, current_lon_);
         }
     }
 
-    //==========================================================================
-    // Callback: CommsStatus - Update mesh network connectivity
-    //==========================================================================
-    
-    /**
-     * @brief Handle comms status updates from west_point_comms_sim.
-     * 
-     * The CommsStatus message contains:
-     *   - direct[]: Entities this robot can communicate with directly
-     *   - transitive[]: Entities reachable through the mesh network
-     * 
-     * TAK COMMUNICATION MODEL:
-     * ------------------------
-     * All TAK/ATAK messages go through the base_station (the TAK server).
-     * The destination callsigns (like "White Cell", "TRILL") are ATAK users
-     * that are all reached through the base_station.
-     * 
-     * Therefore, the comms check is binary:
-     *   - "base_station" in transitive → CAN send TAK messages
-     *   - "base_station" NOT in transitive → CANNOT send TAK messages
-     * 
-     * If this callback is never called (comms_sim not running), we default
-     * to allowing all messages (assumes comms are up).
-     * 
-     * @param msg The CommsStatus message from west_point_comms_sim
-     */
-    void commsStatusCallback(const west_point_comms_sim::msg::CommsStatus::SharedPtr msg)
+    // -------------------------------------------------------------------------
+    // Comms status
+    // -------------------------------------------------------------------------
+    void commsStatusCallback(
+        const west_point_comms_sim::msg::CommsStatus::SharedPtr msg)
     {
         std::lock_guard<std::mutex> lock(comms_mutex_);
-        
-        // Check if base_station is reachable (either directly or transitively)
+
         bool new_has_comms = false;
-        
-        // Check transitive list (includes multi-hop paths)
-        for (const auto& entity : msg->transitive) {
-            if (entity == "base_station") {
+        for (const auto &e : msg->transitive)
+            if (e == "base_station")
+            {
                 new_has_comms = true;
                 break;
             }
-        }
-        
-        // Also check direct list (should be subset of transitive, but be safe)
-        if (!new_has_comms) {
-            for (const auto& entity : msg->direct) {
-                if (entity == "base_station") {
+        if (!new_has_comms)
+            for (const auto &e : msg->direct)
+                if (e == "base_station")
+                {
                     new_has_comms = true;
                     break;
                 }
-            }
-        }
-        
-        // First time receiving comms status - log the transition
-        if (!comms_status_received_) {
+
+        if (!comms_status_received_)
+        {
             comms_status_received_ = true;
-            RCLCPP_INFO(this->get_logger(),
-                "[Comms] First comms_status received - base_station %s",
-                new_has_comms ? "REACHABLE (TAK enabled)" : "UNREACHABLE (TAK disabled)");
+            RCLCPP_INFO(get_logger(), "[Comms] base_station %s",
+                        new_has_comms ? "REACHABLE" : "UNREACHABLE");
         }
-        // Log state changes
-        else if (new_has_comms != has_base_station_comms_) {
-            if (new_has_comms) {
-                RCLCPP_INFO(this->get_logger(),
-                    "[Comms] Connection to base_station RESTORED - TAK messaging enabled");
-            } else {
-                RCLCPP_WARN(this->get_logger(),
-                    "[Comms] Connection to base_station LOST - TAK messaging disabled");
-            }
+        else if (new_has_comms != has_base_station_comms_)
+        {
+            RCLCPP_INFO(get_logger(), "[Comms] base_station %s",
+                        new_has_comms ? "RESTORED" : "LOST");
         }
-        
+
         has_base_station_comms_ = new_has_comms;
     }
-    
-    /**
-     * @brief Check if TAK messages can be sent (base_station is reachable).
-     * 
-     * BEHAVIOR:
-     *   - If comms_status has never been received (comms_sim not running):
-     *     Returns true (default to allowing TAK messages)
-     *   - If comms_status is active:
-     *     Returns true only if "base_station" is in the transitive list
-     * 
-     * @return true if TAK messages can be sent
-     */
+
     bool hasComms()
     {
         std::lock_guard<std::mutex> lock(comms_mutex_);
-        
-        // If we've never received comms_status, assume comms are up
-        // This is the "comms_sim not running" fallback
-        if (!comms_status_received_) {
-            return true;
-        }
-        
-        return has_base_station_comms_;
-    }
-    
-    /**
-     * @brief Get the current comms status for logging/debugging.
-     * 
-     * @return A string describing the current comms state
-     */
-    std::string getCommsStatusString()
-    {
-        std::lock_guard<std::mutex> lock(comms_mutex_);
-        
-        if (!comms_status_received_) {
-            return "no comms_status received (defaulting to comms OK)";
-        }
-        
-        return has_base_station_comms_ 
-            ? "base_station REACHABLE" 
-            : "base_station UNREACHABLE";
+        // If comms_sim is not running, default to comms OK
+        return !comms_status_received_ || has_base_station_comms_;
     }
 
-    //==========================================================================
-    // Callback: TakChat OUT (ROS -> TAK)
-    //==========================================================================
-    
-    /**
-     * @brief Handle outgoing chat requests from BT nodes.
-     * 
-     * Messages are checked for base_station connectivity before being queued:
-     *   - If base_station is reachable (or comms_sim not running): queue message
-     *   - If base_station is unreachable: suppress with warning
-     * 
-     * For broadcast messages ("ALL"), all destinations are queued if comms are up,
-     * or all are suppressed if comms are down.
-     * 
-     * UID OVERRIDE SUPPORT:
-     * ---------------------
-     * If the TakChat message includes a non-empty 'uid' field, that UID will be
-     * passed through to the CoT generation instead of generating a random one.
-     * This allows testing whether ATAK treats messages with identical UIDs as
-     * updates/replacements rather than new messages.
-     */
+    // -------------------------------------------------------------------------
+    // tak_chat/out — main entry point from BT nodes
+    // -------------------------------------------------------------------------
     void takChatOutCallback(const tak_chat::msg::TakChat::SharedPtr msg)
     {
-        // Parse the uid field which encodes: "event_uid|message_id"
-        std::string uid_field = msg->uid;
-        std::string event_uid_part;
-        std::string message_id_part;
-        
-        size_t separator_pos = uid_field.find('|');
-        if (separator_pos != std::string::npos) {
-            // Format: "event_uid|message_id"
-            event_uid_part = uid_field.substr(0, separator_pos);
-            message_id_part = uid_field.substr(separator_pos + 1);
-        } else if (!uid_field.empty()) {
-            // Legacy format: use same value for both (backward compatible)
-            event_uid_part = uid_field;
-            message_id_part = uid_field;
-        }
-        
-        // Build log string
-        std::string uid_info = "";
-        if (!event_uid_part.empty() || !message_id_part.empty()) {
-            std::ostringstream oss;
-            oss << " [";
-            if (!event_uid_part.empty()) {
-                oss << "EventUID=" << event_uid_part.substr(0, std::min(size_t(8), event_uid_part.length())) << "...";
-            } else {
-                oss << "EventUID=random";
-            }
-            oss << ", ";
-            if (!message_id_part.empty()) {
-                oss << "MsgID=" << message_id_part.substr(0, std::min(size_t(8), message_id_part.length())) << "...";
-            } else {
-                oss << "MsgID=random";
-            }
-            oss << "]";
-            uid_info = oss.str();
-        }
-        
-        RCLCPP_INFO(this->get_logger(),
-            "[TakChat RECV] origin='%s' dest='%s' msg='%s'%s",
-            msg->origin.c_str(), msg->destination.c_str(), msg->message.c_str(), uid_info.c_str());
-        
-        // Verify the message is from this robot
-        if (msg->origin != callsign_) {
-            RCLCPP_WARN(this->get_logger(),
-                "[TakChat REJECTED] origin='%s' does not match our callsign='%s'",
-                msg->origin.c_str(), callsign_.c_str());
+        // Resolve chat_type — empty string means unicast (backward compat)
+        const std::string chat_type = msg->chat_type.empty()
+                                          ? ChatType::UNICAST
+                                          : msg->chat_type;
+
+        RCLCPP_INFO(get_logger(),
+                    "[TakChat OUT] type='%s' origin='%s' dest='%s' chatroom='%s' msg='%s'",
+                    chat_type.c_str(), msg->origin.c_str(), msg->destination.c_str(),
+                    msg->chatroom.c_str(), msg->message.c_str());
+
+        // Verify origin matches our callsign
+        if (msg->origin != callsign_)
+        {
+            RCLCPP_WARN(get_logger(),
+                        "[TakChat OUT] REJECTED — origin '%s' != callsign '%s'",
+                        msg->origin.c_str(), callsign_.c_str());
             return;
         }
 
-        // Check if we have comms to base_station (TAK server)
-        if (!hasComms()) {
-            RCLCPP_WARN(this->get_logger(),
-                "[TakChat SUPPRESSED] No comms to base_station - message not sent: '%s'",
-                msg->message.c_str());
+        // Comms gate — all TAK messages go through base_station
+        if (!hasComms())
+        {
+            RCLCPP_WARN(get_logger(),
+                        "[TakChat OUT] SUPPRESSED — no comms to base_station");
             return;
         }
 
-        // Pass the uid field through (will be decoded again in buildGeoChatCoT)
-        std::string override_uid = msg->uid;
+        // ------------------------------------------------------------------
+        // BACKWARD COMPAT: legacy destination="ALL" fan-out
+        // Only applies when chat_type is empty or "unicast" AND dest is "ALL"
+        // ------------------------------------------------------------------
+        if ((chat_type == ChatType::UNICAST) &&
+            (msg->destination == BROADCAST_DESTINATION))
+        {
+            RCLCPP_INFO(get_logger(),
+                        "[TakChat OUT] Legacy ALL broadcast — fanning out to %zu callsigns",
+                        allowed_callsigns_.size());
 
-        // Handle broadcast vs single destination
-        if (msg->destination == BROADCAST_DESTINATION) {
-            // Fan out to all allowed callsigns
-            RCLCPP_INFO(this->get_logger(),
-                "[TakChat BROADCAST] Queuing to %zu destinations | Message: %s%s",
-                allowed_callsigns_.size(), msg->message.c_str(), uid_info.c_str());
-            
-            for (const auto& dest : allowed_callsigns_) {
-                addToSendQueue(dest, msg->message, override_uid);
+            for (const auto &dest : allowed_callsigns_)
+            {
+                tak_chat::msg::TakChat unicast = *msg;
+                unicast.destination = dest;
+                unicast.chat_type = ChatType::UNICAST;
+                addToSendQueue(unicast);
             }
-            
-        } else {
-            // Single destination
-            RCLCPP_INFO(this->get_logger(),
-                "[TakChat QUEUED] To: %s | Message: %s%s",
-                msg->destination.c_str(), msg->message.c_str(), uid_info.c_str());
-            
-            addToSendQueue(msg->destination, msg->message, override_uid);
+            return;
         }
-        
-        // Log queue size for debugging
-        std::lock_guard<std::mutex> lock(send_queue_mutex_);
-        if (!send_queue_.empty()) {
-            RCLCPP_INFO(this->get_logger(),
-                "[TakChat QUEUE] %zu message(s) waiting to be sent", send_queue_.size());
-        }
+
+        // All other types go directly to the send queue as-is
+        addToSendQueue(*msg);
     }
 
     //==========================================================================
-    // Send Queue - Ensures messages are sent with delay between them
+    // SECTION: SEND QUEUE
     //==========================================================================
-    
-    /**
-     * @brief Add a message to the send queue.
-     * 
-     * Messages wait in the queue until either:
-     *   - It's the first message to this destination, OR
-     *   - send_delay_s has elapsed since the last send to this destination
-     * 
-     * This allows simultaneous sends to DIFFERENT destinations while
-     * maintaining proper timestamp ordering for the SAME destination.
-     * 
-     * @param destination Target callsign
-     * @param message Message text to send
-     * @param override_uid Optional UID to use instead of random generation
-     */
-    void addToSendQueue(const std::string& destination, 
-                       const std::string& message,
-                       const std::string& override_uid = "")
+
+    void addToSendQueue(const tak_chat::msg::TakChat &msg)
     {
-        QueuedMessage queued;
-        queued.destination = destination;
-        queued.message = message;
-        queued.override_uid = override_uid;
-        queued.queued_time = std::chrono::steady_clock::now();
-        
+        QueuedMessage q;
+        q.tak_msg = msg;
+        q.queued_time = std::chrono::steady_clock::now();
+
         std::lock_guard<std::mutex> lock(send_queue_mutex_);
-        send_queue_.push_back(queued);
+        send_queue_.push_back(q);
+
+        RCLCPP_DEBUG(get_logger(),
+                     "[Queue] Added. Queue size: %zu", send_queue_.size());
     }
-    
-    /**
-     * @brief Timer callback to process the send queue.
-     * 
-     * SIMULTANEOUS MULTI-DESTINATION SENDING:
-     * ---------------------------------------
-     * Messages to DIFFERENT destinations can be sent simultaneously because
-     * each destination has its own independent chat thread.
-     * 
-     * The delay (send_delay_s) only applies when sending consecutive messages
-     * to the SAME destination, ensuring distinct timestamps for proper ordering.
-     * 
-     * For example, a broadcast to 5 callsigns will send all 5 messages at once
-     * (or within the same timer tick), rather than taking 5 seconds.
-     */
+
     void sendQueueTimerCallback()
     {
         auto now = std::chrono::steady_clock::now();
         auto wall_now = std::chrono::system_clock::now();
-        double current_wall_time = std::chrono::duration<double>(
-            wall_now.time_since_epoch()).count();
-        
-        // Collect messages that are ready to send
-        std::vector<QueuedMessage> ready_to_send;
-        
+        double current_wall = std::chrono::duration<double>(
+                                  wall_now.time_since_epoch())
+                                  .count();
+
+        std::vector<QueuedMessage> ready;
+
         {
             std::lock_guard<std::mutex> lock(send_queue_mutex_);
-            
-            if (send_queue_.empty()) {
-                return;  // Nothing to send
-            }
-            
-            // Iterate through queue and collect messages ready to send
-            // We'll remove them after collecting to avoid iterator invalidation
+            if (send_queue_.empty())
+                return;
+
             auto it = send_queue_.begin();
-            while (it != send_queue_.end()) {
-                const std::string& dest = it->destination;
-                
-                // Check both send delay (between consecutive sends) AND reply delay
-                // (waiting until we've passed their message timestamp)
+            while (it != send_queue_.end())
+            {
+                // ----------------------------------------------------------
+                // Rate-limit key: for unicast use destination callsign,
+                // for all other types use chat_type (they don't have a
+                // per-callsign destination so we rate-limit per type).
+                // ----------------------------------------------------------
+                const std::string &chat_type = it->tak_msg.chat_type.empty()
+                                                   ? ChatType::UNICAST
+                                                   : it->tak_msg.chat_type;
+
+                const std::string rate_key =
+                    (chat_type == ChatType::UNICAST)
+                        ? it->tak_msg.destination
+                        : chat_type;
+
                 bool can_send = true;
-                
-                // Check 1: Have we sent to this destination recently?
-                auto last_send_it = last_send_time_per_dest_.find(dest);
-                if (last_send_it != last_send_time_per_dest_.end()) {
-                    double since_last_send = std::chrono::duration<double>(
-                        now - last_send_it->second).count();
-                    
-                    if (since_last_send < send_delay_s_) {
-                        // Not ready yet - need to wait between consecutive sends
+
+                // Check send delay per rate_key
+                auto last_it = last_send_time_per_dest_.find(rate_key);
+                if (last_it != last_send_time_per_dest_.end())
+                {
+                    double since_last = std::chrono::duration<double>(
+                                            now - last_it->second)
+                                            .count();
+                    if (since_last < send_delay_s_)
+                        can_send = false;
+                }
+
+                // Check reply delay (unicast only — reply ordering)
+                if (can_send && chat_type == ChatType::UNICAST)
+                {
+                    auto earliest_it = earliest_reply_time_per_dest_.find(
+                        it->tak_msg.destination);
+                    if (earliest_it != earliest_reply_time_per_dest_.end() &&
+                        current_wall < earliest_it->second)
+                    {
                         can_send = false;
                     }
                 }
-                
-                // Check 2: Have we passed their message timestamp?
-                // This handles clock skew - we wait until our wall clock has passed
-                // their timestamp + buffer, ensuring our reply arrives at TAK server
-                // after their message's server-assigned timestamp.
-                auto earliest_it = earliest_reply_time_per_dest_.find(dest);
-                if (can_send && earliest_it != earliest_reply_time_per_dest_.end()) {
-                    double earliest_reply_time = earliest_it->second;
-                    
-                    if (current_wall_time < earliest_reply_time) {
-                        // Not ready yet - our clock hasn't passed their timestamp
-                        double wait_remaining = earliest_reply_time - current_wall_time;
-                        RCLCPP_DEBUG(this->get_logger(),
-                            "[Reply Delay] Waiting %.1fs more before sending to %s (clock skew handling)",
-                            wait_remaining, dest.c_str());
-                        can_send = false;
-                    }
-                }
-                
-                if (can_send) {
-                    ready_to_send.push_back(*it);
-                    // Update last send time for this destination
-                    last_send_time_per_dest_[dest] = now;
-                    // Remove from queue
+
+                if (can_send)
+                {
+                    ready.push_back(*it);
+                    last_send_time_per_dest_[rate_key] = now;
                     it = send_queue_.erase(it);
-                } else {
+                }
+                else
+                {
                     ++it;
                 }
             }
         }
-        
-        // Now send all ready messages (outside the lock)
-        for (auto& queued : ready_to_send) {
-            // Re-check connectivity at send time
-            if (!hasComms()) {
-                RCLCPP_WARN(this->get_logger(),
-                    "[TakChat DROPPED] Comms to base_station lost while queued - "
-                    "message dropped: '%s' (to: %s)",
-                    queued.message.c_str(), queued.destination.c_str());
+
+        for (auto &q : ready)
+        {
+            if (!hasComms())
+            {
+                RCLCPP_WARN(get_logger(),
+                            "[Queue] Comms lost while queued — dropping '%s'",
+                            q.tak_msg.message.c_str());
                 continue;
             }
-            
-            std::string uid_info = queued.override_uid.empty() ? "" : " [UID: " + queued.override_uid + "]";
-            RCLCPP_INFO(this->get_logger(),
-                "[TakChat SENDING] To: %s | Message: '%s'%s",
-                queued.destination.c_str(), queued.message.c_str(), uid_info.c_str());
-            
-            // Send the message (timestamp determined by sendMessage based on
-            // any incoming messages from this destination)
-            sendMessage(queued.destination, queued.message, queued.override_uid);
-        }
-        
-        // Log if there are still messages waiting
-        {
-            std::lock_guard<std::mutex> lock(send_queue_mutex_);
-            if (!send_queue_.empty()) {
-                RCLCPP_DEBUG(this->get_logger(),
-                    "[TakChat QUEUE] %zu message(s) still waiting (rate-limited)",
-                    send_queue_.size());
-            }
+            dispatchMessage(q.tak_msg);
         }
     }
 
     //==========================================================================
-    // Send a message with retry logic
+    // SECTION: DISPATCH — build CoT and add to pending
     //==========================================================================
-    
+
     /**
-     * @brief Send a message and add to pending for retry tracking.
-     * 
-     * This is called from the send queue timer when it's time to actually
-     * send a message. The timestamp is determined by getResponseTimestamp()
-     * to ensure proper ordering relative to any incoming messages from this
-     * destination.
-     * 
-     * @param destination Target callsign
-     * @param message Message text to send
-     * @param override_uid Optional UID to use instead of random generation
+     * @brief Build CoT XML for the given TakChat message and add to pending.
+     *
+     * This is the central dispatch point. It resolves the chat_type and
+     * calls the appropriate CoT builder. The resulting CoT is stored in
+     * pending_messages_ for retry tracking.
+     *
+     * PENDING KEY:
+     *   For unicast: "destination|message" (existing behavior)
+     *   For all other types: "chat_type|chatroom|message"
+     *   This prevents duplicate sends while allowing the same message
+     *   to be sent to different groups simultaneously.
      */
-    void sendMessage(const std::string& destination, 
-                     const std::string& message,
-                     const std::string& override_uid = "")
+    void dispatchMessage(const tak_chat::msg::TakChat &msg)
     {
-        std::string key = destination + "|" + message;
+        const std::string chat_type = msg.chat_type.empty()
+                                          ? ChatType::UNICAST
+                                          : msg.chat_type;
+
+        // Build pending key
+        std::string key;
+        if (chat_type == ChatType::UNICAST)
+            key = msg.destination + "|" + msg.message;
+        else
+            key = chat_type + "|" + msg.chatroom + "|" + msg.message;
 
         {
             std::lock_guard<std::mutex> lock(pending_mutex_);
-            
-            if (pending_messages_.find(key) != pending_messages_.end()) {
-                RCLCPP_WARN(this->get_logger(),
-                    "[TakChat DEDUP] Message to %s already pending, skipping: '%s'",
-                    destination.c_str(), message.c_str());
+            if (pending_messages_.count(key))
+            {
+                RCLCPP_WARN(get_logger(),
+                            "[Dispatch] Duplicate message already pending, skipping: '%s'",
+                            msg.message.c_str());
                 return;
             }
         }
 
-        // Get the appropriate timestamp for this destination
-        // This ensures our reply appears AFTER their last message in ATAK
-        std::string timestamp = getResponseTimestamp(destination);
+        // Get timestamp (reply-ordered for unicast, current for all others)
+        const std::string timestamp =
+            (chat_type == ChatType::UNICAST)
+                ? getResponseTimestamp(msg.destination)
+                : nowISO();
 
-        // Build CoT XML with the response timestamp and optional UID override
-        std::string cot_xml = buildGeoChatCoT(callsign_, destination, message, timestamp, override_uid);
+        // Build CoT XML based on chat type
+        std::string cot_xml;
+        std::string log_dest;
 
+        if (chat_type == ChatType::UNICAST)
+        {
+            cot_xml = buildUnicastCoT(msg, timestamp);
+            log_dest = msg.destination;
+        }
+        else if (chat_type == ChatType::GROUP)
+        {
+            cot_xml = buildGroupCoT(msg, timestamp);
+            log_dest = "group:" + msg.chatroom;
+        }
+        else if (chat_type == ChatType::TEAM_COLOR)
+        {
+            cot_xml = buildTeamColorCoT(msg, timestamp);
+            log_dest = "team_color:" + msg.chatroom;
+        }
+        else if (chat_type == ChatType::ROLE)
+        {
+            cot_xml = buildRoleCoT(msg, timestamp);
+            log_dest = "role:" + msg.chatroom;
+        }
+        else if (chat_type == ChatType::ALL_CHAT_ROOMS)
+        {
+            cot_xml = buildAllChatRoomsCoT(msg, timestamp);
+            log_dest = "all_chat_rooms";
+        }
+        else if (chat_type == ChatType::ALL_GROUPS)
+        {
+            cot_xml = buildAllGroupsCoT(msg, timestamp);
+            log_dest = "all_groups";
+        }
+        else if (chat_type == ChatType::ALL_TEAMS)
+        {
+            cot_xml = buildAllTeamsCoT(msg, timestamp);
+            log_dest = "all_teams";
+        }
+        else
+        {
+            RCLCPP_ERROR(get_logger(),
+                         "[Dispatch] Unknown chat_type '%s' — dropping message",
+                         chat_type.c_str());
+            return;
+        }
+
+        // Add to pending for retry tracking
         PendingMessage pending;
-        pending.destination = destination;
-        pending.message = message;
+        pending.destination = log_dest;
+        pending.message = msg.message;
         pending.send_timestamp = timestamp;
         pending.cot_xml = cot_xml;
         pending.created_time = std::chrono::steady_clock::now();
@@ -888,725 +733,1066 @@ private:
     }
 
     //==========================================================================
-    // Retry Timer - Core reliability mechanism
+    // SECTION: COT BUILDERS
     //==========================================================================
-    
+
+    // -------------------------------------------------------------------------
+    // Shared: GPS position helper
+    // -------------------------------------------------------------------------
+    void getPosition(double &lat, double &lon)
+    {
+        std::lock_guard<std::mutex> lk(fix_mtx_);
+        lat = current_lat_;
+        lon = current_lon_;
+    }
+
+    // -------------------------------------------------------------------------
+    // Shared: event header + point block
+    //
+    // event uid format varies by type:
+    //   unicast:        GeoChat.{sender}.{dest}.{uuid}
+    //   group:          GeoChat.{sender}.{group_uuid}.{uuid}
+    //   team_color:     GeoChat.{sender}.{color}.{uuid}
+    //   role:           GeoChat.{sender}.{role}.{uuid}
+    //   all_chat_rooms: GeoChat.{sender}.All Chat Rooms.{uuid}
+    //   all_groups:     GeoChat.{sender}.UserGroups.{uuid}
+    //   all_teams:      GeoChat.{sender}.TeamGroups.{uuid}
+    // -------------------------------------------------------------------------
+    std::string buildEventHeader(const std::string &uid_middle_segment,
+                                 const std::string &timestamp,
+                                 const std::string &override_uid = "")
+    {
+        double lat = 0.0, lon = 0.0;
+        getPosition(lat, lon);
+
+        // Resolve message UUID
+        std::string msg_uuid = override_uid.empty() ? randUUID() : override_uid;
+
+        // Build event UID
+        const std::string event_uid =
+            "GeoChat." + callsign_ + "." + uid_middle_segment + "." + msg_uuid;
+
+        // Stale = 24 hours from now
+        const std::string stale = futureISO(86400);
+
+        std::ostringstream xml;
+        xml << std::fixed << std::setprecision(6);
+        xml << "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+            << "<event version=\"2.0\""
+            << " uid=\"" << event_uid << "\""
+            << " type=\"b-t-f\""
+            << " how=\"h-g-i-g-o\""
+            << " time=\"" << timestamp << "\""
+            << " start=\"" << timestamp << "\""
+            << " stale=\"" << stale << "\""
+            << " access=\"Undefined\">"
+            << "<point lat=\"" << lat << "\""
+            << " lon=\"" << lon << "\""
+            << " hae=\"0\""
+            << " ce=\"9999999.0\""
+            << " le=\"9999999.0\"/>";
+
+        return xml.str();
+    }
+
+    // -------------------------------------------------------------------------
+    // Shared: remarks element
+    // -------------------------------------------------------------------------
+    std::string buildRemarks(const std::string &sender,
+                             const std::string &message,
+                             const std::string &timestamp,
+                             const std::string &to_attr = "")
+    {
+        std::ostringstream xml;
+        xml << "<remarks"
+            << " source=\"BAO.F.ATAK." << sender << "\""
+            << (to_attr.empty() ? "" : " to=\"" + to_attr + "\"")
+            << " time=\"" << timestamp << "\">"
+            << escapeXml(message)
+            << "</remarks>";
+        return xml.str();
+    }
+
+    // -------------------------------------------------------------------------
+    // Shared: link element (present in all types except unicast)
+    // -------------------------------------------------------------------------
+    std::string buildLink(const std::string &sender_uid)
+    {
+        return "<link uid=\"" + sender_uid + "\""
+                                             " type=\"a-f-G-U-C\""
+                                             " relation=\"p-p\"/>";
+    }
+
+    // -------------------------------------------------------------------------
+    // Shared: flow tags
+    // -------------------------------------------------------------------------
+    std::string buildFlowTags(const std::string &timestamp)
+    {
+        return "<_flow_tags_ " + tak_server_flow_tag_key_ + "=\"" + timestamp + "\"/>";
+    }
+
+    // =========================================================================
+    // UNICAST CoT
+    // =========================================================================
+    //
+    // Structure:
+    //   __chat parent="RootContactGroup" groupOwner="false"
+    //          chatroom="{dest}" id="{dest}"
+    //     chatgrp uid0="{sender}" uid1="{dest}" id="{dest}"
+    //   <marti><dest callsign="{dest}"/></marti>
+    //   <remarks ...>{message}</remarks>
+    //
+    // NOTE: No <link> element for unicast (matches observed ATAK behavior).
+    // =========================================================================
+    std::string buildUnicastCoT(const tak_chat::msg::TakChat &msg,
+                                const std::string &timestamp)
+    {
+        auto [event_uuid, msg_uuid] = resolveUidOverride(msg.uid);
+
+        const std::string &dest = msg.destination;
+        const std::string &sender = msg.origin;
+
+        // Destination device UID — learned from incoming messages.
+        // Used as the middle segment of the event UID, __chat id, chatgrp uid1,
+        // chatgrp id, and remarks to= attribute.
+        // Falls back to callsign if not yet learned.
+        std::string dest_device_uid;
+        {
+            std::lock_guard<std::mutex> lock(callsign_uid_mutex_);
+            auto it = callsign_to_device_uid_.find(dest);
+            dest_device_uid = (it != callsign_to_device_uid_.end())
+                                  ? it->second
+                                  : dest;
+        }
+
+        if (dest_device_uid == dest)
+        {
+            RCLCPP_WARN(get_logger(),
+                        "[Unicast] No device UID known for '%s' — falling back to callsign. "
+                        "Have '%s' send a message to us first to teach us their UID.",
+                        dest.c_str(), dest.c_str());
+        }
+
+        const std::string msg_uuid_resolved = msg_uuid.empty() ? randUUID() : msg_uuid;
+
+        std::ostringstream xml;
+        // Event UID middle segment = dest device UID (not callsign)
+        xml << buildEventHeader(dest_device_uid, timestamp, event_uuid);
+        xml << "<detail>";
+        xml << buildFlowTags(timestamp);
+        xml << "<__chat"
+            << " parent=\"" << ChatParent::ROOT_CONTACT_GROUP << "\""
+            << " groupOwner=\"false\""
+            << " messageId=\"" << msg_uuid_resolved << "\""
+            << " chatroom=\"" << dest << "\""
+            << " id=\"" << dest_device_uid << "\"" // dest device UID, not callsign
+            << " senderCallsign=\"" << sender << "\">"
+            << "<chatgrp"
+            << " uid0=\"" << sender << "\""          // sender callsign, not device UID
+            << " uid1=\"" << dest_device_uid << "\"" // dest device UID
+            << " id=\"" << dest_device_uid << "\"/>" // dest device UID
+            << "</__chat>";
+        xml << "<marti><dest callsign=\"" << dest << "\"/></marti>";
+        xml << buildLink(sender); // <link uid="warthog1"/> — was missing
+        xml << buildRemarks(sender, msg.message, timestamp,
+                            dest_device_uid); // to= attr with dest device UID
+        xml << "</detail></event>";
+        return xml.str();
+    }
+
+    // =========================================================================
+    // NAMED GROUP CoT
+    // =========================================================================
+    //
+    // Structure:
+    //   __chat parent="UserGroups" groupOwner="true"
+    //          chatroom="{group_name}" id="{group_id}"
+    //     chatgrp uid0="{sender}" uid1..N="{members}" id="{group_id}"
+    //     hierarchy > group(UserGroups) > group({group_id}) > contacts
+    //   <link uid="{sender}"/>
+    //   <remarks ...>{message}</remarks>
+    //
+    // member_uids[0] is always the sender. Additional members follow.
+    // =========================================================================
+    std::string buildGroupCoT(const tak_chat::msg::TakChat &msg,
+                              const std::string &timestamp)
+    {
+        auto [event_uuid, msg_uuid] = resolveUidOverride(msg.uid);
+
+        const std::string &sender = msg.origin;
+        const std::string &group_name = msg.chatroom;
+        const std::string &group_id = msg.chatroom_id;
+
+        std::ostringstream xml;
+        xml << buildEventHeader(group_id, timestamp, event_uuid);
+        xml << "<detail>";
+        xml << buildFlowTags(timestamp);
+
+        // __chat opening tag
+        xml << "<__chat"
+            << " parent=\"" << ChatParent::USER_GROUPS << "\""
+            << " groupOwner=\"true\""
+            << " messageId=\"" << (msg_uuid.empty() ? randUUID() : msg_uuid) << "\""
+            << " chatroom=\"" << group_name << "\""
+            << " id=\"" << group_id << "\""
+            << " senderCallsign=\"" << sender << "\">";
+
+        // chatgrp — sender is uid0, members follow
+        xml << "<chatgrp uid0=\"" << sender << "\"";
+        for (size_t i = 0; i < msg.member_uids.size(); ++i)
+        {
+            // Skip if member_uid is the sender (already uid0)
+            if (msg.member_uids[i] == sender)
+                continue;
+            xml << " uid" << (i + 1) << "=\"" << msg.member_uids[i] << "\"";
+        }
+        xml << " id=\"" << group_id << "\"/>";
+
+        // hierarchy block
+        xml << "<hierarchy>"
+            << "<group uid=\"" << ChatParent::USER_GROUPS << "\" name=\"Groups\">"
+            << "<group uid=\"" << group_id << "\" name=\"" << group_name << "\">";
+
+        // Sender contact first
+        xml << "<contact uid=\"" << sender << "\" name=\"" << sender << "\"/>";
+
+        // Member contacts
+        for (size_t i = 0; i < msg.member_uids.size(); ++i)
+        {
+            if (msg.member_uids[i] == sender)
+                continue;
+            const std::string &name = (i < msg.member_names.size())
+                                          ? msg.member_names[i]
+                                          : msg.member_uids[i];
+            xml << "<contact uid=\"" << msg.member_uids[i]
+                << "\" name=\"" << name << "\"/>";
+        }
+
+        xml << "</group></group></hierarchy>";
+        xml << "</__chat>";
+
+        xml << buildLink(sender);
+        xml << buildRemarks(sender, msg.message, timestamp);
+        xml << "</detail></event>";
+        return xml.str();
+    }
+
+    // =========================================================================
+    // TEAM COLOR CoT
+    // =========================================================================
+    //
+    // Structure:
+    //   __chat parent="TeamGroups" groupOwner="false"
+    //          chatroom="{color}" id="{color}"
+    //     chatgrp uid0="{sender}" id="{color}"
+    //   <link uid="{sender}"/>
+    //   <remarks ...>{message}</remarks>
+    //
+    // chatroom and id are both the color name (e.g. "Cyan", "Red").
+    // =========================================================================
+    std::string buildTeamColorCoT(const tak_chat::msg::TakChat &msg,
+                                  const std::string &timestamp)
+    {
+        auto [event_uuid, msg_uuid] = resolveUidOverride(msg.uid);
+
+        const std::string &sender = msg.origin;
+        const std::string &color = msg.chatroom;
+
+        std::ostringstream xml;
+        xml << buildEventHeader(color, timestamp, event_uuid);
+        xml << "<detail>";
+        xml << buildFlowTags(timestamp);
+        xml << "<__chat"
+            << " parent=\"" << ChatParent::TEAM_GROUPS << "\""
+            << " groupOwner=\"false\""
+            << " messageId=\"" << (msg_uuid.empty() ? randUUID() : msg_uuid) << "\""
+            << " chatroom=\"" << color << "\""
+            << " id=\"" << color << "\""
+            << " senderCallsign=\"" << sender << "\">"
+            << "<chatgrp uid0=\"" << sender << "\" id=\"" << color << "\"/>"
+            << "</__chat>";
+        xml << buildLink(sender);
+        xml << buildRemarks(sender, msg.message, timestamp);
+        xml << "</detail></event>";
+        return xml.str();
+    }
+
+    // =========================================================================
+    // ROLE CoT
+    // =========================================================================
+    //
+    // Structure:
+    //   __chat parent="RootContactGroup" groupOwner="false"
+    //          chatroom="{role}" id="{role}"
+    //     chatgrp uid0="{sender}" id="{role}"
+    //   <link uid="{sender}"/>
+    //   <remarks ...>{message}</remarks>
+    //
+    // Structurally identical to team_color except parent="RootContactGroup".
+    // =========================================================================
+    std::string buildRoleCoT(const tak_chat::msg::TakChat &msg,
+                             const std::string &timestamp)
+    {
+        auto [event_uuid, msg_uuid] = resolveUidOverride(msg.uid);
+
+        const std::string &sender = msg.origin;
+        const std::string &role = msg.chatroom;
+
+        std::ostringstream xml;
+        xml << buildEventHeader(role, timestamp, event_uuid);
+        xml << "<detail>";
+        xml << buildFlowTags(timestamp);
+        xml << "<__chat"
+            << " parent=\"" << ChatParent::ROOT_CONTACT_GROUP << "\""
+            << " groupOwner=\"false\""
+            << " messageId=\"" << (msg_uuid.empty() ? randUUID() : msg_uuid) << "\""
+            << " chatroom=\"" << role << "\""
+            << " id=\"" << role << "\""
+            << " senderCallsign=\"" << sender << "\">"
+            << "<chatgrp uid0=\"" << sender << "\" id=\"" << role << "\"/>"
+            << "</__chat>";
+        xml << buildLink(sender);
+        xml << buildRemarks(sender, msg.message, timestamp);
+        xml << "</detail></event>";
+        return xml.str();
+    }
+
+    // =========================================================================
+    // ALL CHAT ROOMS CoT
+    // =========================================================================
+    //
+    // Structure:
+    //   __chat parent="RootContactGroup" groupOwner="false"
+    //          chatroom="All Chat Rooms" id="All Chat Rooms"
+    //     chatgrp uid0="{sender}" uid1="All Chat Rooms" id="All Chat Rooms"
+    //   <link uid="{sender}"/>
+    //   <remarks to="All Chat Rooms" ...>{message}</remarks>
+    //
+    // NOTE: remarks has a to="All Chat Rooms" attribute — unique to this type.
+    // =========================================================================
+    std::string buildAllChatRoomsCoT(const tak_chat::msg::TakChat &msg,
+                                     const std::string &timestamp)
+    {
+        auto [event_uuid, msg_uuid] = resolveUidOverride(msg.uid);
+
+        const std::string &sender = msg.origin;
+
+        std::ostringstream xml;
+        xml << buildEventHeader(ChatRoom::ALL_CHAT_ROOMS, timestamp, event_uuid);
+        xml << "<detail>";
+        xml << buildFlowTags(timestamp);
+        xml << "<__chat"
+            << " parent=\"" << ChatParent::ROOT_CONTACT_GROUP << "\""
+            << " groupOwner=\"false\""
+            << " messageId=\"" << (msg_uuid.empty() ? randUUID() : msg_uuid) << "\""
+            << " chatroom=\"" << ChatRoom::ALL_CHAT_ROOMS << "\""
+            << " id=\"" << ChatRoom::ALL_CHAT_ROOMS << "\""
+            << " senderCallsign=\"" << sender << "\">"
+            << "<chatgrp"
+            << " uid0=\"" << sender << "\""
+            << " uid1=\"" << ChatRoom::ALL_CHAT_ROOMS << "\""
+            << " id=\"" << ChatRoom::ALL_CHAT_ROOMS << "\"/>"
+            << "</__chat>";
+        xml << buildLink(sender);
+        // NOTE: to= attribute is unique to All Chat Rooms
+        xml << buildRemarks(sender, msg.message, timestamp, ChatRoom::ALL_CHAT_ROOMS);
+        xml << "</detail></event>";
+        return xml.str();
+    }
+
+    // =========================================================================
+    // ALL GROUPS CoT
+    // =========================================================================
+    //
+    // Structure:
+    //   __chat parent="RootContactGroup" groupOwner="false"
+    //          chatroom="Groups" id="UserGroups"
+    //     chatgrp uid0="{sender}" id="UserGroups"
+    //   <link uid="{sender}"/>
+    //   <remarks ...>{message}</remarks>
+    //
+    // NOTE: chatroom != id here ("Groups" vs "UserGroups").
+    // =========================================================================
+    std::string buildAllGroupsCoT(const tak_chat::msg::TakChat &msg,
+                                  const std::string &timestamp)
+    {
+        auto [event_uuid, msg_uuid] = resolveUidOverride(msg.uid);
+
+        const std::string &sender = msg.origin;
+
+        std::ostringstream xml;
+        xml << buildEventHeader(ChatRoom::ALL_GROUPS_ID, timestamp, event_uuid);
+        xml << "<detail>";
+        xml << buildFlowTags(timestamp);
+        xml << "<__chat"
+            << " parent=\"" << ChatParent::ROOT_CONTACT_GROUP << "\""
+            << " groupOwner=\"false\""
+            << " messageId=\"" << (msg_uuid.empty() ? randUUID() : msg_uuid) << "\""
+            << " chatroom=\"" << ChatRoom::ALL_GROUPS << "\""
+            << " id=\"" << ChatRoom::ALL_GROUPS_ID << "\""
+            << " senderCallsign=\"" << sender << "\">"
+            << "<chatgrp uid0=\"" << sender << "\" id=\"" << ChatRoom::ALL_GROUPS_ID << "\"/>"
+            << "</__chat>";
+        xml << buildLink(sender);
+        xml << buildRemarks(sender, msg.message, timestamp);
+        xml << "</detail></event>";
+        return xml.str();
+    }
+
+    // =========================================================================
+    // ALL TEAMS CoT
+    // =========================================================================
+    //
+    // Structure:
+    //   __chat parent="RootContactGroup" groupOwner="false"
+    //          chatroom="Teams" id="TeamGroups"
+    //     chatgrp uid0="{sender}" id="TeamGroups"
+    //   <link uid="{sender}"/>
+    //   <remarks ...>{message}</remarks>
+    //
+    // NOTE: chatroom != id here ("Teams" vs "TeamGroups").
+    // =========================================================================
+    std::string buildAllTeamsCoT(const tak_chat::msg::TakChat &msg,
+                                 const std::string &timestamp)
+    {
+        auto [event_uuid, msg_uuid] = resolveUidOverride(msg.uid);
+
+        const std::string &sender = msg.origin;
+
+        std::ostringstream xml;
+        xml << buildEventHeader(ChatRoom::ALL_TEAMS_ID, timestamp, event_uuid);
+        xml << "<detail>";
+        xml << buildFlowTags(timestamp);
+        xml << "<__chat"
+            << " parent=\"" << ChatParent::ROOT_CONTACT_GROUP << "\""
+            << " groupOwner=\"false\""
+            << " messageId=\"" << (msg_uuid.empty() ? randUUID() : msg_uuid) << "\""
+            << " chatroom=\"" << ChatRoom::ALL_TEAMS << "\""
+            << " id=\"" << ChatRoom::ALL_TEAMS_ID << "\""
+            << " senderCallsign=\"" << sender << "\">"
+            << "<chatgrp uid0=\"" << sender << "\" id=\"" << ChatRoom::ALL_TEAMS_ID << "\"/>"
+            << "</__chat>";
+        xml << buildLink(sender);
+        xml << buildRemarks(sender, msg.message, timestamp);
+        xml << "</detail></event>";
+        return xml.str();
+    }
+
+    //==========================================================================
+    // SECTION: RETRY LOGIC
+    //==========================================================================
+
     void retryTimerCallback()
     {
         auto now = std::chrono::steady_clock::now();
         std::vector<std::string> to_remove;
         std::vector<std::string> to_publish;
-        
-        size_t subscriber_count = pub_cot_->get_subscription_count();
-        
+
+        size_t sub_count = pub_cot_->get_subscription_count();
+
         {
             std::lock_guard<std::mutex> lock(pending_mutex_);
-            
-            for (auto& [key, pending] : pending_messages_) {
-                if (pending.complete) {
+
+            for (auto &[key, pending] : pending_messages_)
+            {
+                if (pending.complete)
+                {
                     to_remove.push_back(key);
                     continue;
                 }
-                
-                double elapsed_s = std::chrono::duration<double>(
-                    now - pending.created_time).count();
-                
-                if (elapsed_s >= retry_timeout_s_) {
-                    if (pending.subscriber_seen) {
-                        RCLCPP_WARN(this->get_logger(),
-                            "[TakChat TIMEOUT] To: %s after %d publishes (%.1fs) - "
-                            "subscriber was seen, message likely delivered",
-                            pending.destination.c_str(), pending.publish_count, elapsed_s);
-                    } else {
-                        RCLCPP_ERROR(this->get_logger(),
-                            "[TakChat TIMEOUT] To: %s after %d publishes (%.1fs) - "
-                            "NO SUBSCRIBER EVER SEEN, message likely LOST",
-                            pending.destination.c_str(), pending.publish_count, elapsed_s);
+
+                double elapsed = std::chrono::duration<double>(
+                                     now - pending.created_time)
+                                     .count();
+
+                if (elapsed >= retry_timeout_s_)
+                {
+                    if (pending.subscriber_seen)
+                    {
+                        RCLCPP_WARN(get_logger(),
+                                    "[Retry] Timeout after %d publishes — subscriber seen, "
+                                    "likely delivered: '%s'",
+                                    pending.publish_count, pending.destination.c_str());
+                    }
+                    else
+                    {
+                        RCLCPP_ERROR(get_logger(),
+                                     "[Retry] Timeout after %d publishes — NO SUBSCRIBER, "
+                                     "message likely LOST: '%s'",
+                                     pending.publish_count, pending.destination.c_str());
                     }
                     to_remove.push_back(key);
                     continue;
                 }
-                
-                if (subscriber_count > 0) {
-                    if (!pending.subscriber_seen) {
-                        RCLCPP_DEBUG(this->get_logger(),
-                            "Subscriber discovered for message to %s",
-                            pending.destination.c_str());
-                    }
+
+                if (sub_count > 0)
                     pending.subscriber_seen = true;
-                }
-                
-                if (pending.subscriber_seen && pending.publish_count >= min_retry_count_) {
-                    RCLCPP_INFO(this->get_logger(),
-                        "[TakChat DELIVERED] To: %s after %d publish(es)",
-                        pending.destination.c_str(), pending.publish_count);
+
+                if (pending.subscriber_seen &&
+                    pending.publish_count >= min_retry_count_)
+                {
+                    RCLCPP_INFO(get_logger(),
+                                "[Retry] Delivered to '%s' after %d publish(es)",
+                                pending.destination.c_str(), pending.publish_count);
                     pending.complete = true;
                     to_remove.push_back(key);
                     continue;
                 }
-                
-                if (pending.publish_count > 0) {
-                    double since_last_publish_s = std::chrono::duration<double>(
-                        now - pending.last_publish_time).count();
-                    
-                    if (since_last_publish_s >= retry_interval_s_) {
+
+                if (pending.publish_count > 0)
+                {
+                    double since_last = std::chrono::duration<double>(
+                                            now - pending.last_publish_time)
+                                            .count();
+                    if (since_last >= retry_interval_s_)
                         to_publish.push_back(key);
-                    }
                 }
             }
         }
-        
-        for (const auto& key : to_publish) {
+
+        for (const auto &key : to_publish)
             doPublish(key);
-        }
-        
+
         {
             std::lock_guard<std::mutex> lock(pending_mutex_);
-            for (const auto& key : to_remove) {
+            for (const auto &key : to_remove)
                 pending_messages_.erase(key);
-            }
         }
     }
 
-    //==========================================================================
-    // Publish CoT XML
-    //==========================================================================
-    
-    void doPublish(const std::string& key)
+    void doPublish(const std::string &key)
     {
         std::string cot_xml;
         std::string destination;
-        std::string send_timestamp;
         int publish_count;
-        size_t subscriber_count;
-        
+
         {
             std::lock_guard<std::mutex> lock(pending_mutex_);
-            
             auto it = pending_messages_.find(key);
-            if (it == pending_messages_.end()) {
+            if (it == pending_messages_.end())
                 return;
-            }
-            
-            PendingMessage& pending = it->second;
-            pending.publish_count++;
-            pending.last_publish_time = std::chrono::steady_clock::now();
-            
-            cot_xml = pending.cot_xml;
-            destination = pending.destination;
-            send_timestamp = pending.send_timestamp;
-            publish_count = pending.publish_count;
+
+            PendingMessage &p = it->second;
+            p.publish_count++;
+            p.last_publish_time = std::chrono::steady_clock::now();
+
+            cot_xml = p.cot_xml;
+            destination = p.destination;
+            publish_count = p.publish_count;
         }
-        
-        subscriber_count = pub_cot_->get_subscription_count();
-        
-        std_msgs::msg::String out_msg;
-        out_msg.data = cot_xml;
-        pub_cot_->publish(out_msg);
-        
-        if (publish_count == 1) {
-            RCLCPP_INFO(this->get_logger(),
-                "[TakChat SEND #1] To: %s | timestamp=%s | subscribers: %zu",
-                destination.c_str(), send_timestamp.c_str(), subscriber_count);
-        } else {
-            RCLCPP_INFO(this->get_logger(),
-                "[TakChat RETRY #%d] To: %s | subscribers: %zu",
-                publish_count, destination.c_str(), subscriber_count);
+
+        std_msgs::msg::String out;
+        out.data = cot_xml;
+        pub_cot_->publish(out);
+
+        size_t sub_count = pub_cot_->get_subscription_count();
+
+        if (publish_count == 1)
+        {
+            RCLCPP_INFO(get_logger(),
+                        "[Publish #1] To: '%s' | subscribers: %zu",
+                        destination.c_str(), sub_count);
+        }
+        else
+        {
+            RCLCPP_INFO(get_logger(),
+                        "[Publish #%d] To: '%s' | subscribers: %zu",
+                        publish_count, destination.c_str(), sub_count);
         }
     }
 
     //==========================================================================
-    // Callback: Incoming CoT (TAK -> ROS)
+    // SECTION: INCOMING COT PARSING
     //==========================================================================
-    
+
+    /**
+     * @brief Parse incoming b-t-f CoT and forward to tak_chat/in.
+     *
+     * TAK server handles group membership routing. If we receive a message,
+     * the server decided to deliver it to us. We forward all b-t-f messages
+     * from allowed senders without local membership filtering.
+     *
+     * Populates chat_type, chatroom, chatroom_id on the forwarded TakChat
+     * message so BT nodes can filter/route based on message type.
+     */
     void incomingCotCallback(const std_msgs::msg::String::SharedPtr msg)
     {
-        // Only process GeoChat messages (type="b-t-f")
-        if (msg->data.find("type=\"b-t-f\"") == std::string::npos) {
+        // Only process GeoChat messages
+        if (msg->data.find("type=\"b-t-f\"") == std::string::npos)
             return;
-        }
 
-        std::string sender, recipient, message, timestamp;
-        if (!parseGeoChatCoT(msg->data, sender, recipient, message, timestamp)) {
-            RCLCPP_WARN(this->get_logger(), "Failed to parse incoming GeoChat CoT");
-            return;
-        }
+        // Parse all fields
+        std::string sender, chatroom, chatroom_id, chat_parent,
+            message, timestamp, chat_type;
 
-        // Ignore our own messages (echo from the TAK bridge reflecting our sends)
-        if (sender == callsign_) {
-            return;
-        }
-
-        // Gate on base_station connectivity.
-        //
-        // WHY: All TAK messages — both outgoing and incoming — travel through
-        // the base_station (TAK server).  If we can't reach the base_station we
-        // aren't really "receiving" a live message; we're seeing a stale relay
-        // or a simulator artifact.  Dropping it here prevents the BT tree from
-        // acting on information it shouldn't have while comm-denied, and keeps
-        // last_incoming_messages_ / earliest_reply_time_per_dest_ clean so that
-        // reply ordering logic doesn't get confused by a gap in connectivity.
-        //
-        // NOTE: If comms_sim is not running, hasComms() defaults to true, so
-        // this guard is a no-op in bench-test environments.
-        if (!hasComms()) {
-            RCLCPP_WARN(this->get_logger(),
-                "[TakChat IN] SUPPRESSED — no comms to base_station | "
-                "from: '%s' | msg: '%s' | status: %s",
-                sender.c_str(), message.c_str(),
-                getCommsStatusString().c_str());
-            return;
-        }
-
-        // Filter to only allowed callsigns
-        if (allowed_callsigns_set_.find(sender) == allowed_callsigns_set_.end()) {
-            RCLCPP_DEBUG(this->get_logger(),
-                "[TakChat IN] IGNORED - sender '%s' not in allowed list",
-                sender.c_str());
-            return;
-        }
-
-        // Record this message's timestamp so when we reply, our response
-        // will have a timestamp that appears AFTER theirs in ATAK's chat
-        recordIncomingMessage(sender, timestamp);
-
-        RCLCPP_INFO(this->get_logger(),
-            "[TakChat IN] From: %s | To: %s | Message: %s",
-            sender.c_str(), recipient.c_str(), message.c_str());
-
-        tak_chat::msg::TakChat tak_msg;
-        tak_msg.origin = sender;
-        tak_msg.destination = recipient;
-        tak_msg.message = message;
-        tak_msg.timestamp = timestamp;
-        tak_msg.uid = "";  // Not needed for incoming messages
-
-        pub_tak_chat_in_->publish(tak_msg);
-    }
-    
-    //==========================================================================
-    // Last Incoming Message Tracking (for proper response ordering)
-    //==========================================================================
-    
-    /**
-     * @brief Record the timestamp of an incoming message from a callsign.
-     * 
-     * This function serves TWO purposes:
-     * 
-     * 1. TIMESTAMP TRACKING: Records their message timestamp so that when we
-     *    reply, we can use their_timestamp + RESPONSE_DELAY_S to ensure our
-     *    reply appears AFTER their message in ATAK's chat view.
-     * 
-     * 2. SEND DELAY ENFORCEMENT: Stores their parsed timestamp so the send
-     *    queue can wait until our clock has passed their timestamp before
-     *    sending. This handles clock skew between devices - if their clock
-     *    is ahead of ours, we wait longer; if behind, we can send sooner.
-     * 
-     *    This is necessary because ATAK sorts messages by the `event time`
-     *    attribute, which the TAK server sets based on when IT receives the
-     *    message. With clock skew, a fixed delay doesn't work - we need to
-     *    ensure our message arrives at the TAK server AFTER their message's
-     *    timestamp.
-     * 
-     * @param callsign The sender's callsign
-     * @param their_timestamp ISO8601 timestamp from their message
-     */
-    void recordIncomingMessage(const std::string& callsign, const std::string& their_timestamp)
-    {
-        // Parse their timestamp to get seconds since epoch
-        double their_time_seconds = parseISOTimestamp(their_timestamp);
-        
-        // Record their timestamp for proper response timestamp calculation
+        if (!parseGeoChatCoT(msg->data, sender, chatroom, chatroom_id,
+                             chat_parent, message, timestamp, chat_type))
         {
-            std::lock_guard<std::mutex> lock(last_incoming_mutex_);
-            
-            LastIncomingMessage msg;
-            msg.timestamp = their_timestamp;
-            msg.received_at = std::chrono::steady_clock::now();
-            
-            last_incoming_messages_[callsign] = msg;
-            
-            RCLCPP_DEBUG(this->get_logger(),
-                "[Timestamp] Recorded message from %s at %s",
-                callsign.c_str(), their_timestamp.c_str());
+            RCLCPP_WARN(get_logger(), "[Incoming] Failed to parse GeoChat CoT");
+            return;
         }
-        
-        // CRITICAL: Store their parsed timestamp for reply delay enforcement
-        // The send queue will wait until our clock passes their_time + buffer
-        // before sending any reply. This handles clock skew automatically:
-        // - If their clock is ahead: we wait longer
-        // - If their clock is behind: we can send sooner
-        //
-        // SAFETY CAP: We never wait more than MAX_REPLY_WAIT_S to handle cases
-        // where a device's clock is wildly off (hours/days ahead).
+
+        // Ignore our own echoes
+        if (sender == callsign_)
+            return;
+
+        // Comms gate
+        if (!hasComms())
         {
-            std::lock_guard<std::mutex> lock(send_queue_mutex_);
-            
-            auto now = std::chrono::system_clock::now();
-            double current_time = std::chrono::duration<double>(
-                now.time_since_epoch()).count();
-            
-            if (their_time_seconds > 0) {
-                // Calculate when we'd ideally reply (their time + small buffer)
-                double ideal_reply_time = their_time_seconds + reply_delay_s_;
-                
-                // Calculate the maximum time we're willing to wait
-                double max_reply_time = current_time + MAX_REPLY_WAIT_S;
-                
-                // Use the earlier of the two (cap the wait time)
-                double earliest_reply_time = std::min(ideal_reply_time, max_reply_time);
-                earliest_reply_time_per_dest_[callsign] = earliest_reply_time;
-                
-                // Calculate how long we'll wait from now (for logging)
-                double wait_time = earliest_reply_time - current_time;
-                
-                if (ideal_reply_time > max_reply_time) {
-                    // Clock skew is large - we're capping the wait
-                    RCLCPP_WARN(this->get_logger(),
-                        "[Reply Delay] Their clock is %.1fs ahead! Capping wait to %.1fs for %s",
-                        (their_time_seconds - current_time), MAX_REPLY_WAIT_S, callsign.c_str());
-                } else if (wait_time > 0) {
-                    RCLCPP_INFO(this->get_logger(),
-                        "[Reply Delay] Will wait %.1fs before sending to %s (their clock is %.1fs ahead)",
-                        wait_time, callsign.c_str(), (their_time_seconds - current_time));
-                } else {
-                    RCLCPP_INFO(this->get_logger(),
-                        "[Reply Delay] Can send to %s immediately (their clock is %.1fs behind)",
-                        callsign.c_str(), (current_time - their_time_seconds));
-                }
-            } else {
-                // Failed to parse their timestamp - fall back to current time + small delay
-                earliest_reply_time_per_dest_[callsign] = current_time + reply_delay_s_;
-                
-                RCLCPP_WARN(this->get_logger(),
-                    "[Reply Delay] Could not parse timestamp from %s, using fixed %.1fs delay",
-                    callsign.c_str(), reply_delay_s_);
+            RCLCPP_WARN(get_logger(),
+                        "[Incoming] SUPPRESSED — no comms to base_station | from: '%s'",
+                        sender.c_str());
+            return;
+        }
+
+        // Filter to allowed senders
+        if (allowed_callsigns_set_.find(sender) == allowed_callsigns_set_.end())
+        {
+            RCLCPP_DEBUG(get_logger(),
+                         "[Incoming] IGNORED — sender '%s' not in allowed list", sender.c_str());
+            return;
+        }
+
+        // Record for reply ordering (unicast only)
+        if (chat_type == ChatType::UNICAST)
+        {
+            recordIncomingMessage(sender, timestamp);
+        }
+
+        // Learn sender's device UID from chatgrp uid0.
+        // uid0 is always the sender's device UID (e.g. ANDROID-49c8964ab97f24bc).
+        // We cache this so outgoing unicasts can populate uid1 correctly.
+        {
+            const auto member_uids = parseChatGrpMembers(msg->data);
+            if (!member_uids.empty() && member_uids[0] != sender)
+            {
+                std::lock_guard<std::mutex> lock(callsign_uid_mutex_);
+                callsign_to_device_uid_[sender] = member_uids[0];
+                RCLCPP_DEBUG(get_logger(),
+                             "[Incoming] Learned UID: %s → %s",
+                             sender.c_str(), member_uids[0].c_str());
             }
         }
-    }
-    
-    /**
-     * @brief Get the appropriate timestamp for replying to a callsign.
-     * 
-     * RESPONSE ORDERING LOGIC:
-     * ------------------------
-     * To ensure our reply appears AFTER their message in ATAK's chat, we use
-     * the MAXIMUM of two candidate timestamps:
-     * 
-     *   1. their_timestamp + RESPONSE_DELAY_S  (relative to their message)
-     *   2. current_time + CURRENT_TIME_BUFFER_S (relative to now)
-     * 
-     * This dual approach handles CLOCK SKEW between devices:
-     *   - If their clock is behind ours: (1) might be in our past, so we use (2)
-     *   - If their clock is ahead of ours: (1) ensures we're after their message
-     * 
-     * CRITICAL: After calculating a response timestamp, we UPDATE the stored
-     * timestamp to the response value. This ensures that if we send MULTIPLE
-     * messages in quick succession, each one gets a progressively LATER timestamp.
-     * 
-     * STALENESS CHECKS:
-     * -----------------
-     * We consider a stored timestamp "stale" if it was received more than 5
-     * minutes ago. After that, we only use current time.
-     * 
-     * @param destination The callsign we're replying to
-     * @return ISO8601 timestamp to use for our outgoing message
-     */
-    std::string getResponseTimestamp(const std::string& destination)
-    {
-        std::lock_guard<std::mutex> lock(last_incoming_mutex_);
-        
-        // Get current time - we'll need this regardless
-        auto now = std::chrono::system_clock::now();
-        double current_time_seconds = std::chrono::duration<double>(
-            now.time_since_epoch()).count();
-        
-        auto it = last_incoming_messages_.find(destination);
-        
-        if (it == last_incoming_messages_.end()) {
-            // No recorded message from this destination - use current time + buffer
-            double response_time = current_time_seconds + CURRENT_TIME_BUFFER_S;
-            std::string response_timestamp = secondsToISO(response_time);
-            RCLCPP_DEBUG(this->get_logger(),
-                "[Timestamp] No record for %s, using current time + buffer = %s",
-                destination.c_str(), response_timestamp.c_str());
-            return response_timestamp;
-        }
-        
-        // Check if the record is stale (received more than 5 minutes ago)
-        auto age = std::chrono::steady_clock::now() - it->second.received_at;
-        if (age > std::chrono::minutes(5)) {
-            double response_time = current_time_seconds + CURRENT_TIME_BUFFER_S;
-            std::string response_timestamp = secondsToISO(response_time);
-            RCLCPP_DEBUG(this->get_logger(),
-                "[Timestamp] Record from %s is stale (%.1f min), using current time + buffer = %s",
-                destination.c_str(),
-                std::chrono::duration<double, std::ratio<60>>(age).count(),
-                response_timestamp.c_str());
-            return response_timestamp;
-        }
-        
-        // Parse their stored timestamp
-        double their_time_seconds = parseISOTimestamp(it->second.timestamp);
-        if (their_time_seconds < 0) {
-            double response_time = current_time_seconds + CURRENT_TIME_BUFFER_S;
-            std::string response_timestamp = secondsToISO(response_time);
-            RCLCPP_WARN(this->get_logger(),
-                "[Timestamp] Failed to parse timestamp from %s, using current time + buffer = %s",
-                destination.c_str(), response_timestamp.c_str());
-            return response_timestamp;
-        }
-        
-        // Calculate both candidate timestamps
-        double candidate_from_their_time = their_time_seconds + RESPONSE_DELAY_S;
-        double candidate_from_current_time = current_time_seconds + CURRENT_TIME_BUFFER_S;
-        
-        // Use the MAXIMUM to handle clock skew in either direction
-        double response_time_seconds = std::max(candidate_from_their_time, candidate_from_current_time);
-        
-        // Convert back to ISO format
-        std::string response_timestamp = secondsToISO(response_time_seconds);
-        
-        // Log which timestamp we chose
-        if (candidate_from_their_time >= candidate_from_current_time) {
-            RCLCPP_INFO(this->get_logger(),
-                "[Timestamp] Reply to %s: using their_time + delay = %s (their=%s + %.1fs)",
-                destination.c_str(), response_timestamp.c_str(),
-                it->second.timestamp.c_str(), RESPONSE_DELAY_S);
-        } else {
-            RCLCPP_INFO(this->get_logger(),
-                "[Timestamp] Reply to %s: using current_time + buffer = %s (clock skew detected: their_time was %.1fs behind)",
-                destination.c_str(), response_timestamp.c_str(),
-                current_time_seconds - their_time_seconds);
-        }
-        
-        // CRITICAL: Update the stored timestamp to be our response timestamp
-        // This ensures that the NEXT message to this destination will have
-        // a timestamp AFTER this one, maintaining proper ordering
-        it->second.timestamp = response_timestamp;
-        // Don't reset received_at - we want staleness based on original incoming message
-        
-        return response_timestamp;
-    }
-    
-    /**
-     * @brief Parse an ISO8601 timestamp string to seconds since epoch.
-     * 
-     * Handles formats like:
-     *   - 2026-01-08T15:00:34.114Z
-     *   - 2026-01-08T15:00:34Z
-     * 
-     * @param iso_timestamp The timestamp string
-     * @return Seconds since epoch, or -1.0 on parse error
-     */
-    double parseISOTimestamp(const std::string& iso_timestamp)
-    {
-        if (iso_timestamp.empty()) return -1.0;
-        
-        std::tm tm = {};
-        double fractional_seconds = 0.0;
-        
-        // Find the 'T' separator
-        size_t t_pos = iso_timestamp.find('T');
-        if (t_pos == std::string::npos) return -1.0;
-        
-        // Parse date: YYYY-MM-DD
-        if (sscanf(iso_timestamp.c_str(), "%d-%d-%d",
-                   &tm.tm_year, &tm.tm_mon, &tm.tm_mday) != 3) {
-            return -1.0;
-        }
-        tm.tm_year -= 1900;  // Years since 1900
-        tm.tm_mon -= 1;      // Months are 0-based
-        
-        // Parse time: HH:MM:SS
-        if (sscanf(iso_timestamp.c_str() + t_pos + 1, "%d:%d:%d",
-                   &tm.tm_hour, &tm.tm_min, &tm.tm_sec) != 3) {
-            return -1.0;
-        }
-        
-        // Parse optional fractional seconds
-        size_t dot_pos = iso_timestamp.find('.', t_pos);
-        if (dot_pos != std::string::npos) {
-            size_t end_pos = iso_timestamp.find('Z', dot_pos);
-            if (end_pos == std::string::npos) {
-                end_pos = iso_timestamp.length();
+
+        RCLCPP_INFO(get_logger(),
+                    "[Incoming] type='%s' from='%s' chatroom='%s' msg='%s'",
+                    chat_type.c_str(), sender.c_str(), chatroom.c_str(), message.c_str());
+
+        // Forward to BT nodes
+        tak_chat::msg::TakChat out;
+        out.origin = sender;
+        out.destination = callsign_;
+        out.message = message;
+        out.timestamp = timestamp;
+        out.chat_type = chat_type;
+        out.chatroom = chatroom;
+        out.chatroom_id = chatroom_id;
+
+        // Populate uid from messageId (useful for downstream deduplication)
+        out.uid = extractXmlAttr(msg->data, "messageId");
+
+        // Populate member lists from chatgrp uid0..N attributes
+        out.member_uids = parseChatGrpMembers(msg->data);
+
+        // For group type, resolve display names from <hierarchy><contact> elements.
+        // For all other types, fall back to using uids as names.
+        if (chat_type == ChatType::GROUP)
+        {
+            auto name_map = parseHierarchyNames(msg->data);
+            out.member_names.reserve(out.member_uids.size());
+            for (const auto &uid : out.member_uids)
+            {
+                auto it = name_map.find(uid);
+                out.member_names.push_back(
+                    (it != name_map.end()) ? it->second : uid);
             }
-            std::string frac_str = iso_timestamp.substr(dot_pos, end_pos - dot_pos);
-            fractional_seconds = std::stod(frac_str);
         }
-        
-        // Convert to time_t (seconds since epoch, UTC)
-        time_t seconds = timegm(&tm);
-        if (seconds == -1) return -1.0;
-        
-        return static_cast<double>(seconds) + fractional_seconds;
+        else
+        {
+            // Non-group types have no hierarchy block — names mirror uids
+            out.member_names = out.member_uids;
+        }
+
+        pub_tak_chat_in_->publish(out);
     }
 
-    //==========================================================================
-    // CoT Parsing
-    //==========================================================================
-    
-    bool parseGeoChatCoT(const std::string& xml,
-                         std::string& sender,
-                         std::string& recipient,
-                         std::string& message,
-                         std::string& timestamp)
+    /**
+     * @brief Parse a b-t-f GeoChat CoT XML string into its component fields.
+     *
+     * Determines chat_type by examining __chat parent and chatroom/id values:
+     *
+     *   parent=UserGroups                          → group
+     *   parent=TeamGroups                          → team_color
+     *   parent=RootContactGroup, chatroom=chatroom_id:
+     *     chatroom == "All Chat Rooms"             → all_chat_rooms
+     *     chatroom == "Groups"                     → all_groups
+     *     chatroom == "Teams"                      → all_teams
+     *     otherwise                                → role
+     *   parent=RootContactGroup, chatroom!=chatroom_id → unicast
+     *     (unicast: chatroom=dest callsign, id=dest callsign — they match,
+     *      but we distinguish from role by checking if chatroom is in
+     *      allowed_callsigns_set_)
+     *
+     * NOTE ON UNICAST vs ROLE DISAMBIGUATION:
+     *   Both unicast and role have parent=RootContactGroup and chatroom==id.
+     *   We distinguish them by checking if chatroom is a known callsign.
+     *   If chatroom is in allowed_callsigns_set_ → unicast.
+     *   Otherwise → role.
+     */
+    bool parseGeoChatCoT(const std::string &xml,
+                         std::string &sender,
+                         std::string &chatroom,
+                         std::string &chatroom_id,
+                         std::string &chat_parent,
+                         std::string &message,
+                         std::string &timestamp,
+                         std::string &chat_type)
     {
-        // Extract sender callsign from __chat element (required)
-        sender = extractXmlAttribute(xml, "senderCallsign");
-        if (sender.empty()) return false;
+        // Required: senderCallsign
+        sender = extractXmlAttr(xml, "senderCallsign");
+        if (sender.empty())
+            return false;
 
-        // Extract recipient - try chatroom first, then to attribute
-        recipient = extractXmlAttribute(xml, "chatroom");
-        if (recipient.empty()) recipient = extractXmlAttribute(xml, "to");
-        if (recipient.empty()) recipient = callsign_;  // Default to us
-
-        // Extract message text from <remarks> element (required)
+        // Required: message text from <remarks>
         message = extractXmlElementContent(xml, "remarks");
-        if (message.empty()) return false;
+        if (message.empty())
+            return false;
         message = unescapeXml(message);
 
-        // Extract timestamp - prefer remarks time (when user sent message)
-        // over event time (when server processed it)
-        // 
-        // CoT has multiple timestamps:
-        //   - event time: When TAK server received/processed message
-        //   - remarks time: When ATAK user actually sent the message
-        //   - start: When message becomes "valid"
-        //
-        // The remarks time is most accurate for chat message ordering.
-        timestamp = extractRemarksTimeAttribute(xml);
-        if (timestamp.empty()) {
-            // Fallback to event time if remarks time not found
-            timestamp = extractXmlAttribute(xml, "time");
-        }
-        if (timestamp.empty()) {
+        // Chatroom and id attributes from __chat
+        chatroom = extractXmlAttr(xml, "chatroom");
+        chatroom_id = extractXmlAttr(xml, "id");
+        chat_parent = extractXmlAttr(xml, "parent");
+
+        // Timestamp — prefer remarks time, fall back to event time
+        timestamp = extractRemarksTime(xml);
+        if (timestamp.empty())
+            timestamp = extractXmlAttr(xml, "time");
+        if (timestamp.empty())
             timestamp = nowISO();
+
+        // ------------------------------------------------------------------
+        // Determine chat_type from structural attributes
+        // ------------------------------------------------------------------
+        if (chat_parent == ChatParent::USER_GROUPS)
+        {
+            chat_type = ChatType::GROUP;
+        }
+        else if (chat_parent == ChatParent::TEAM_GROUPS)
+        {
+            chat_type = ChatType::TEAM_COLOR;
+        }
+        else if (chat_parent == ChatParent::ROOT_CONTACT_GROUP)
+        {
+            if (chatroom == ChatRoom::ALL_CHAT_ROOMS)
+            {
+                chat_type = ChatType::ALL_CHAT_ROOMS;
+            }
+            else if (chatroom == ChatRoom::ALL_GROUPS)
+            {
+                chat_type = ChatType::ALL_GROUPS;
+            }
+            else if (chatroom == ChatRoom::ALL_TEAMS)
+            {
+                chat_type = ChatType::ALL_TEAMS;
+            }
+            else
+            {
+                // Unicast vs Role disambiguation:
+                // If chatroom is a known callsign → unicast
+                // Otherwise → role
+                if (allowed_callsigns_set_.count(chatroom) ||
+                    chatroom == callsign_)
+                {
+                    chat_type = ChatType::UNICAST;
+                }
+                else
+                {
+                    chat_type = ChatType::ROLE;
+                }
+            }
+        }
+        else
+        {
+            // Unknown parent — treat as unicast for safety
+            chat_type = ChatType::UNICAST;
         }
 
         return true;
     }
-    
-    /**
-     * @brief Extract the time attribute from the <remarks> element.
-     * 
-     * The remarks element looks like:
-     *   <remarks source="..." to="..." time="2026-01-08T15:00:34.114Z">message</remarks>
-     * 
-     * This time is when the ATAK user actually sent the message, which is
-     * more accurate than the event time (set by TAK server).
-     * 
-     * @param xml The full CoT XML string
-     * @return The remarks time attribute value, or empty string if not found
-     */
-    std::string extractRemarksTimeAttribute(const std::string& xml)
+
+    //==========================================================================
+    // SECTION: REPLY TIMESTAMP ORDERING
+    //==========================================================================
+
+    void recordIncomingMessage(const std::string &callsign,
+                               const std::string &their_timestamp)
     {
-        // Find the <remarks element
-        size_t remarks_start = xml.find("<remarks");
-        if (remarks_start == std::string::npos) return "";
-        
-        // Find the closing > of the remarks opening tag
-        size_t remarks_end = xml.find(">", remarks_start);
-        if (remarks_end == std::string::npos) return "";
-        
-        // Extract just the remarks opening tag
-        std::string remarks_tag = xml.substr(remarks_start, remarks_end - remarks_start);
-        
-        // Find time=" within the remarks tag
-        size_t time_start = remarks_tag.find("time=\"");
-        if (time_start == std::string::npos) return "";
-        time_start += 6;  // Skip past 'time="'
-        
-        size_t time_end = remarks_tag.find("\"", time_start);
-        if (time_end == std::string::npos) return "";
-        
-        return remarks_tag.substr(time_start, time_end - time_start);
+        {
+            std::lock_guard<std::mutex> lock(last_incoming_mutex_);
+            LastIncomingMessage rec;
+            rec.timestamp = their_timestamp;
+            rec.received_at = std::chrono::steady_clock::now();
+            last_incoming_messages_[callsign] = rec;
+        }
+
+        double their_time = parseISOTimestamp(their_timestamp);
+
+        {
+            std::lock_guard<std::mutex> lock(send_queue_mutex_);
+            auto now = std::chrono::system_clock::now();
+            double current = std::chrono::duration<double>(
+                                 now.time_since_epoch())
+                                 .count();
+
+            if (their_time > 0)
+            {
+                double ideal = their_time + reply_delay_s_;
+                double max_wait = current + MAX_REPLY_WAIT_S;
+                earliest_reply_time_per_dest_[callsign] =
+                    std::min(ideal, max_wait);
+            }
+            else
+            {
+                earliest_reply_time_per_dest_[callsign] = current + reply_delay_s_;
+            }
+        }
     }
 
-    std::string extractXmlAttribute(const std::string& xml, const std::string& attr_name)
+    std::string getResponseTimestamp(const std::string &destination)
     {
-        const std::string search = attr_name + "=\"";
+        std::lock_guard<std::mutex> lock(last_incoming_mutex_);
+
+        auto now = std::chrono::system_clock::now();
+        double current = std::chrono::duration<double>(
+                             now.time_since_epoch())
+                             .count();
+
+        auto it = last_incoming_messages_.find(destination);
+        if (it == last_incoming_messages_.end())
+            return secondsToISO(current + CURRENT_TIME_BUFFER_S);
+
+        // Stale after 5 minutes
+        auto age = std::chrono::steady_clock::now() - it->second.received_at;
+        if (age > std::chrono::minutes(5))
+            return secondsToISO(current + CURRENT_TIME_BUFFER_S);
+
+        double their_time = parseISOTimestamp(it->second.timestamp);
+        if (their_time < 0)
+            return secondsToISO(current + CURRENT_TIME_BUFFER_S);
+
+        double response = std::max(their_time + RESPONSE_DELAY_S,
+                                   current + CURRENT_TIME_BUFFER_S);
+
+        // Update stored timestamp so consecutive replies keep advancing
+        it->second.timestamp = secondsToISO(response);
+
+        return secondsToISO(response);
+    }
+
+    //==========================================================================
+    // SECTION: XML UTILITIES
+    //==========================================================================
+
+    std::string extractXmlAttr(const std::string &xml,
+                               const std::string &attr_name)
+    {
+        const std::string search = " " + attr_name + "=\"";
         size_t start = xml.find(search);
-        if (start == std::string::npos) return "";
-        start += search.length();
+        if (start == std::string::npos)
+            return "";
+        start += search.size();
         size_t end = xml.find('"', start);
-        if (end == std::string::npos) return "";
+        if (end == std::string::npos)
+            return "";
         return xml.substr(start, end - start);
     }
 
-    std::string extractXmlElementContent(const std::string& xml, const std::string& element_name)
+    std::string extractXmlElementContent(const std::string &xml,
+                                         const std::string &element)
     {
-        const std::string open_tag = "<" + element_name;
-        size_t tag_start = xml.find(open_tag);
-        if (tag_start == std::string::npos) return "";
-        
+        const std::string open = "<" + element;
+        size_t tag_start = xml.find(open);
+        if (tag_start == std::string::npos)
+            return "";
         size_t content_start = xml.find('>', tag_start);
-        if (content_start == std::string::npos) return "";
-        content_start++;
-        
-        const std::string close_tag = "</" + element_name + ">";
-        size_t content_end = xml.find(close_tag, content_start);
-        if (content_end == std::string::npos) return "";
-        
+        if (content_start == std::string::npos)
+            return "";
+        ++content_start;
+        const std::string close = "</" + element + ">";
+        size_t content_end = xml.find(close, content_start);
+        if (content_end == std::string::npos)
+            return "";
         return xml.substr(content_start, content_end - content_start);
     }
 
-    std::string unescapeXml(const std::string& s)
+    std::string extractRemarksTime(const std::string &xml)
     {
-        std::string result = s;
+        size_t start = xml.find("<remarks");
+        if (start == std::string::npos)
+            return "";
+        size_t end = xml.find('>', start);
+        if (end == std::string::npos)
+            return "";
+        std::string tag = xml.substr(start, end - start);
+
+        size_t t = tag.find("time=\"");
+        if (t == std::string::npos)
+            return "";
+        t += 6;
+        size_t te = tag.find('"', t);
+        if (te == std::string::npos)
+            return "";
+        return tag.substr(t, te - t);
+    }
+
+    static std::string unescapeXml(const std::string &s)
+    {
+        std::string r = s;
         size_t pos;
-        
-        while ((pos = result.find("&lt;")) != std::string::npos)   result.replace(pos, 4, "<");
-        while ((pos = result.find("&gt;")) != std::string::npos)   result.replace(pos, 4, ">");
-        while ((pos = result.find("&quot;")) != std::string::npos) result.replace(pos, 6, "\"");
-        while ((pos = result.find("&apos;")) != std::string::npos) result.replace(pos, 6, "'");
-        while ((pos = result.find("&amp;")) != std::string::npos)  result.replace(pos, 5, "&");
-        
-        return result;
+        while ((pos = r.find("<")) != std::string::npos)
+            r.replace(pos, 4, "<");
+        while ((pos = r.find(">")) != std::string::npos)
+            r.replace(pos, 4, ">");
+        while ((pos = r.find("&quot;")) != std::string::npos)
+            r.replace(pos, 6, "\"");
+        while ((pos = r.find("&apos;")) != std::string::npos)
+            r.replace(pos, 6, "'");
+        while ((pos = r.find("'")) != std::string::npos)
+            r.replace(pos, 6, "'");
+        while ((pos = r.find("&")) != std::string::npos)
+            r.replace(pos, 5, "&");
+        return r;
     }
 
-    //==========================================================================
-    // CoT Building
-    //==========================================================================
-    
-    /**
-     * @brief Build a GeoChat CoT XML message.
-     * 
-     * The timestamp should already be correctly adjusted by the caller using
-     * getResponseTimestamp() to ensure proper message ordering in ATAK.
-     * 
-     * UID OVERRIDE SUPPORT:
-     * ---------------------
-     * The override_uid parameter uses the format: "event_uid|message_id"
-     * 
-     * This allows independent control of each identifier:
-     *   - "uuid1|uuid2" → Event UID uses uuid1, messageId uses uuid2
-     *   - "uuid1|"      → Event UID uses uuid1, messageId is random
-     *   - "|uuid2"      → Event UID is random, messageId uses uuid2
-     *   - "uuid1"       → Both use uuid1 (legacy, backward compatible)
-     *   - ""            → Both random (default)
-     * 
-     * This enables testing which identifier ATAK uses as the primary key:
-     *   /reuse-both  → Tests if matching both IDs causes overwrites
-     *   /reuse-event → Tests if only event UID matters
-     *   /reuse-msgid → Tests if only messageId matters
-     * 
-     * @param sender This robot's callsign
-     * @param destination Target callsign
-     * @param message The chat message text
-     * @param timestamp The timestamp to use (already adjusted for ordering)
-     * @param override_uid Encoded as "event_uid|message_id"
-     * @return Complete CoT XML string
-     */
-    std::string buildGeoChatCoT(const std::string& sender,
-                                const std::string& destination,
-                                const std::string& message,
-                                const std::string& timestamp,
-                                const std::string& override_uid = "")
+    static std::string escapeXml(const std::string &s)
     {
-        const std::string time_now = timestamp;
-        
-        // Stale time is calculated from actual current time
-        // This ensures the message doesn't expire prematurely
-        const std::string time_stale = futureISO(60);
-
-        double lat = 0.0, lon = 0.0;
+        std::string r;
+        r.reserve(static_cast<size_t>(s.size() * 1.1));
+        for (char c : s)
         {
-            std::lock_guard<std::mutex> lk(fix_mtx_);
-            lat = current_lat_;
-            lon = current_lon_;
-        }
-
-        // Parse override_uid field: "event_uid|message_id"
-        // This allows independent control of each identifier for testing
-        std::string event_uid_override;
-        std::string message_id_override;
-        
-        if (!override_uid.empty()) {
-            size_t separator_pos = override_uid.find('|');
-            if (separator_pos != std::string::npos) {
-                // Format: "event_uid|message_id"
-                event_uid_override = override_uid.substr(0, separator_pos);
-                message_id_override = override_uid.substr(separator_pos + 1);
-            } else {
-                // Legacy format: use same value for both (backward compatible)
-                event_uid_override = override_uid;
-                message_id_override = override_uid;
+            switch (c)
+            {
+            case '&':
+                r += "&";
+                break;
+            case '<':
+                r += "<";
+                break;
+            case '>':
+                r += ">";
+                break;
+            case '"':
+                r += "&quot;";
+                break;
+            case '\'':
+                r += "&apos;";
+                break;
+            default:
+                r += c;
+                break;
             }
         }
-        
-        // Generate UID - use override if provided, otherwise generate random
-        std::string uid;
-        std::string chat_id;
-        
-        if (!event_uid_override.empty()) {
-            // Use the provided event UID
-            uid = std::string("GeoChat.") + sender + ".ANDROID-" + android_id_ + "." + event_uid_override;
-        } else {
-            // Generate random event UID (normal operation)
-            uid = std::string("GeoChat.") + sender + ".ANDROID-" + android_id_ + "." + randUUID();
-        }
-        
-        if (!message_id_override.empty()) {
-            // Use the provided messageId
-            chat_id = message_id_override;
-        } else {
-            // Generate random messageId (normal operation)
-            chat_id = randUUID();
-        }
-
-        std::ostringstream xml;
-        
-        xml << "<event version=\"2.0\" uid=\"" << uid
-            << "\" type=\"b-t-f\" how=\"h-g-i-g-o\" time=\"" << time_now
-            << "\" start=\"" << time_now << "\" stale=\"" << time_stale
-            << "\" access=\"Undefined\">";
-
-        xml << "<point lat=\"" << std::fixed << std::setprecision(6) << lat
-            << "\" lon=\"" << std::fixed << std::setprecision(6) << lon
-            << "\" hae=\"0\" ce=\"10\" le=\"10\"/>";
-
-        xml << "<detail>";
-        
-        xml << "<_flow_tags_ " << tak_server_flow_tag_key_ << "=\"" << time_now << "\"/>";
-
-        xml << "<__chat parent=\"RootContactGroup\" groupOwner=\"false\""
-            << " messageId=\"" << chat_id
-            << "\" chatroom=\"" << destination
-            << "\" id=\"" << destination
-            << "\" senderCallsign=\"" << sender << "\"/>";
-
-        xml << "<marti><dest callsign=\"" << destination << "\"/></marti>";
-
-        xml << "<remarks source=\"" << sender << "\" time=\"" << time_now
-            << "\">" << escapeXml(message) << "</remarks>";
-
-        xml << "</detail></event>";
-
-        return xml.str();
+        return r;
     }
 
-    //==========================================================================
-    // Utility Functions
-    //==========================================================================
-    
-    static std::string escapeXml(const std::string& s)
+    // -------------------------------------------------------------------------
+    // parseChatGrpMembers()
+    // -------------------------------------------------------------------------
+    // Extracts uid0, uid1, uid2... from the <chatgrp> element.
+    // WHY: chatgrp encodes group membership for all chat types. We parse all
+    // sequential uidN attributes until one is missing.
+    // -------------------------------------------------------------------------
+    static std::vector<std::string> parseChatGrpMembers(const std::string &xml)
     {
-        std::string result;
-        result.reserve(static_cast<size_t>(s.size() * 1.1));
-        
-        for (char c : s) {
-            switch (c) {
-                case '&':  result += "&amp;";  break;
-                case '<':  result += "&lt;";   break;
-                case '>':  result += "&gt;";   break;
-                case '"':  result += "&quot;"; break;
-                case '\'': result += "&apos;"; break;
-                default:   result += c;        break;
-            }
+        std::vector<std::string> uids;
+
+        // Find the chatgrp element bounds first to avoid matching uid attributes
+        // from other elements (e.g. <link uid="...">)
+        size_t grp_start = xml.find("<chatgrp");
+        if (grp_start == std::string::npos)
+            return uids;
+        size_t grp_end = xml.find("/>", grp_start);
+        if (grp_end == std::string::npos)
+            return uids;
+        const std::string grp = xml.substr(grp_start, grp_end - grp_start);
+
+        // Extract uid0, uid1, uid2... until one is missing
+        for (int i = 0; i < 64; ++i)
+        {
+            const std::string key = " uid" + std::to_string(i) + "=\"";
+            size_t pos = grp.find(key);
+            if (pos == std::string::npos)
+                break;
+            pos += key.size();
+            size_t end = grp.find('"', pos);
+            if (end == std::string::npos)
+                break;
+            uids.push_back(grp.substr(pos, end - pos));
         }
-        return result;
+
+        return uids;
     }
+
+    // -------------------------------------------------------------------------
+    // parseHierarchyNames()
+    // -------------------------------------------------------------------------
+    // Extracts uid→name pairs from <contact uid="..." name="..."/> elements
+    // inside the <hierarchy> block (present in group-type CoT only).
+    // Returns a map from uid to display name.
+    // -------------------------------------------------------------------------
+    static std::map<std::string, std::string> parseHierarchyNames(
+        const std::string &xml)
+    {
+        std::map<std::string, std::string> names;
+
+        size_t hier_start = xml.find("<hierarchy>");
+        size_t hier_end = xml.find("</hierarchy>");
+        if (hier_start == std::string::npos || hier_end == std::string::npos)
+            return names;
+
+        const std::string hier = xml.substr(hier_start, hier_end - hier_start);
+
+        size_t pos = 0;
+        while ((pos = hier.find("<contact", pos)) != std::string::npos)
+        {
+            size_t tag_end = hier.find("/>", pos);
+            if (tag_end == std::string::npos)
+                break;
+            const std::string tag = hier.substr(pos, tag_end - pos);
+
+            // Extract uid and name from this <contact> tag
+            std::string uid, name;
+
+            size_t u = tag.find(" uid=\"");
+            if (u != std::string::npos)
+            {
+                u += 6;
+                size_t ue = tag.find('"', u);
+                if (ue != std::string::npos)
+                    uid = tag.substr(u, ue - u);
+            }
+
+            size_t n = tag.find(" name=\"");
+            if (n != std::string::npos)
+            {
+                n += 7;
+                size_t ne = tag.find('"', n);
+                if (ne != std::string::npos)
+                    name = tag.substr(n, ne - n);
+            }
+
+            if (!uid.empty())
+                names[uid] = name.empty() ? uid : name;
+            pos = tag_end + 2;
+        }
+
+        return names;
+    }
+
+    //==========================================================================
+    // SECTION: TIMESTAMP UTILITIES
+    //==========================================================================
 
     static std::string nowISO()
     {
@@ -1615,148 +1801,195 @@ private:
         std::time_t t = system_clock::to_time_t(now);
         std::tm tm{};
         gmtime_r(&t, &tm);
-        
         std::ostringstream oss;
         oss << std::put_time(&tm, "%Y-%m-%dT%H:%M:%S");
-        
-        auto micros = duration_cast<microseconds>(now.time_since_epoch()).count() % 1000000;
-        oss << "." << std::setw(6) << std::setfill('0') << micros << "Z";
-        
+        auto us = duration_cast<microseconds>(now.time_since_epoch()).count() % 1000000;
+        oss << "." << std::setw(6) << std::setfill('0') << us << "Z";
         return oss.str();
     }
 
-    static std::string futureISO(int sec)
+    static std::string futureISO(int seconds_ahead)
     {
         using namespace std::chrono;
-        auto fut = system_clock::now() + seconds(sec);
+        auto fut = system_clock::now() + seconds(seconds_ahead);
         std::time_t t = system_clock::to_time_t(fut);
         std::tm tm{};
         gmtime_r(&t, &tm);
-        
         std::ostringstream oss;
         oss << std::put_time(&tm, "%Y-%m-%dT%H:%M:%S");
-        
-        auto micros = duration_cast<microseconds>(fut.time_since_epoch()).count() % 1000000;
-        oss << "." << std::setw(6) << std::setfill('0') << micros << "Z";
-        
+        auto us = duration_cast<microseconds>(fut.time_since_epoch()).count() % 1000000;
+        oss << "." << std::setw(6) << std::setfill('0') << us << "Z";
         return oss.str();
     }
-    
-    /**
-     * @brief Convert seconds since epoch to ISO8601 timestamp string.
-     * 
-     * @param seconds_since_epoch Time in seconds since Unix epoch (UTC)
-     * @return ISO8601 formatted timestamp (e.g., "2026-01-08T15:00:34.114000Z")
-     */
+
     std::string secondsToISO(double seconds_since_epoch)
     {
         using namespace std::chrono;
-        
         auto tp = system_clock::time_point(
-            duration_cast<system_clock::duration>(
-                duration<double>(seconds_since_epoch)));
-        
+            duration_cast<system_clock::duration>(duration<double>(seconds_since_epoch)));
         std::time_t t = system_clock::to_time_t(tp);
         std::tm tm{};
         gmtime_r(&t, &tm);
-        
         std::ostringstream oss;
         oss << std::put_time(&tm, "%Y-%m-%dT%H:%M:%S");
-        
-        // Preserve microsecond precision
-        auto micros = duration_cast<microseconds>(tp.time_since_epoch()).count() % 1000000;
-        oss << "." << std::setw(6) << std::setfill('0') << micros << "Z";
-        
+        auto us = duration_cast<microseconds>(tp.time_since_epoch()).count() % 1000000;
+        oss << "." << std::setw(6) << std::setfill('0') << us << "Z";
         return oss.str();
     }
+
+    static double parseISOTimestamp(const std::string &ts)
+    {
+        if (ts.empty())
+            return -1.0;
+        std::tm tm = {};
+        double frac = 0.0;
+
+        size_t t_pos = ts.find('T');
+        if (t_pos == std::string::npos)
+            return -1.0;
+
+        if (sscanf(ts.c_str(), "%d-%d-%d",
+                   &tm.tm_year, &tm.tm_mon, &tm.tm_mday) != 3)
+            return -1.0;
+        tm.tm_year -= 1900;
+        tm.tm_mon -= 1;
+
+        if (sscanf(ts.c_str() + t_pos + 1, "%d:%d:%d",
+                   &tm.tm_hour, &tm.tm_min, &tm.tm_sec) != 3)
+            return -1.0;
+
+        size_t dot = ts.find('.', t_pos);
+        if (dot != std::string::npos)
+        {
+            size_t z = ts.find('Z', dot);
+            if (z == std::string::npos)
+                z = ts.size();
+            frac = std::stod(ts.substr(dot, z - dot));
+        }
+
+        time_t sec = timegm(&tm);
+        if (sec == -1)
+            return -1.0;
+        return static_cast<double>(sec) + frac;
+    }
+
+    //==========================================================================
+    // SECTION: UUID + UID UTILITIES
+    //==========================================================================
 
     static std::string randUUID()
     {
         std::random_device rd;
         std::mt19937 gen(rd());
-        std::uniform_int_distribution<int> dis(0, 15);
-        std::uniform_int_distribution<int> dis2(8, 11);
-        
-        std::stringstream ss;
+        std::uniform_int_distribution<int> d(0, 15);
+        std::uniform_int_distribution<int> d2(8, 11);
+
+        std::ostringstream ss;
         ss << std::hex;
-        
-        for (int i = 0; i < 8; ++i) ss << dis(gen);
+        for (int i = 0; i < 8; ++i)
+        {
+            ss << d(gen);
+        }
         ss << '-';
-        for (int i = 0; i < 4; ++i) ss << dis(gen);
+        for (int i = 0; i < 4; ++i)
+        {
+            ss << d(gen);
+        }
         ss << "-4";
-        for (int i = 0; i < 3; ++i) ss << dis(gen);
+        for (int i = 0; i < 3; ++i)
+        {
+            ss << d(gen);
+        }
         ss << '-';
-        ss << dis2(gen);
-        for (int i = 0; i < 3; ++i) ss << dis(gen);
+        ss << d2(gen);
+        for (int i = 0; i < 3; ++i)
+        {
+            ss << d(gen);
+        }
         ss << '-';
-        for (int i = 0; i < 12; ++i) ss << dis(gen);
-        
+        for (int i = 0; i < 12; ++i)
+        {
+            ss << d(gen);
+        }
         return ss.str();
     }
 
+    /**
+     * @brief Resolve the uid field into event_uuid and msg_uuid components.
+     *
+     * uid field format: "event_uuid|msg_uuid"
+     *   - Both parts optional. Empty part → auto-generate.
+     *   - Legacy format (no '|'): use same value for both.
+     *   - Empty string: both auto-generated (normal operation).
+     *
+     * @return pair<event_uuid, msg_uuid> — either may be empty (→ auto-generate)
+     */
+    static std::pair<std::string, std::string> resolveUidOverride(
+        const std::string &uid_field)
+    {
+        if (uid_field.empty())
+            return {"", ""};
+
+        size_t sep = uid_field.find('|');
+        if (sep != std::string::npos)
+            return {uid_field.substr(0, sep), uid_field.substr(sep + 1)};
+
+        // Legacy: no separator — use same value for both
+        return {uid_field, uid_field};
+    }
+
     //==========================================================================
-    // Member Variables
+    // MEMBER VARIABLES
     //==========================================================================
-    
+
     // --- Identity ---
     std::string callsign_;
-    std::string android_id_;
     std::string tak_server_flow_tag_key_;
-    
-    // --- Allowed callsigns (for filtering incoming messages) ---
+
+    // Callsign → device UID learned from incoming CoT.
+    // WHY: ATAK routes chatgrp by device UID, not callsign.
+    // Populated passively when we receive messages from a callsign.
+    std::map<std::string, std::string> callsign_to_device_uid_;
+    std::mutex callsign_uid_mutex_;
+
+    // --- Allowed callsigns ---
     std::vector<std::string> allowed_callsigns_;
     std::set<std::string> allowed_callsigns_set_;
-    
-    // --- Retry/timing configuration ---
+
+    // --- Timing configuration ---
     double retry_timeout_s_;
     double retry_interval_s_;
     int min_retry_count_;
-    double send_delay_s_;      // Min delay between consecutive sends to same dest
-    double reply_delay_s_;     // Min delay after receiving before sending reply
+    double send_delay_s_;
+    double reply_delay_s_;
 
-    // --- GPS position ---
+    // --- GPS ---
     std::mutex fix_mtx_;
     bool fix_received_;
     double current_lat_;
     double current_lon_;
 
-    // --- Comms status (base_station connectivity) ---
-    // Tracks whether we can reach the base_station (TAK server) via the mesh network
-    // All TAK/ATAK messages go through base_station, so this is a binary check
+    // --- Comms status ---
     std::mutex comms_mutex_;
-    bool comms_status_received_{false};     // Have we ever received comms_status?
-    bool has_base_station_comms_{false};    // Is base_station in transitive list?
+    bool comms_status_received_;
+    bool has_base_station_comms_;
 
-    // --- Send queue (ensures delay between messages to SAME destination) ---
+    // --- Send queue ---
     std::deque<QueuedMessage> send_queue_;
     std::mutex send_queue_mutex_;
-    // Track last send time PER DESTINATION - allows simultaneous sends to different destinations
     std::map<std::string, std::chrono::steady_clock::time_point> last_send_time_per_dest_;
-    // Track earliest reply time per destination (wall-clock seconds since epoch)
-    // This handles clock skew - we wait until our clock passes their timestamp + buffer
     std::map<std::string, double> earliest_reply_time_per_dest_;
 
-    // --- Pending messages (for retry tracking) ---
+    // --- Pending messages (retry tracking) ---
     std::map<std::string, PendingMessage> pending_messages_;
     std::mutex pending_mutex_;
-    
-    // --- Last incoming message per callsign (for proper response ordering) ---
-    // When replying to someone, we use their timestamp + delay to ensure our
-    // response appears AFTER their message in ATAK's chat view
+
+    // --- Reply ordering ---
     std::map<std::string, LastIncomingMessage> last_incoming_messages_;
     std::mutex last_incoming_mutex_;
-    
-    // Minimum delay (seconds) to add to incoming timestamp when replying.
-    // Must be large enough to account for network latency + processing time.
+
     static constexpr double RESPONSE_DELAY_S = 2.0;
-    
-    // Buffer (seconds) to add to current time when using current-time-based timestamp.
-    // This handles cases where their clock is behind ours.
     static constexpr double CURRENT_TIME_BUFFER_S = 0.5;
-    
-    // Maximum time (seconds) to wait before replying, regardless of clock skew.
-    // This prevents excessive delays if a device's clock is wildly off (hours/days ahead).
-    // Set to a reasonable value that handles typical clock drift but caps extreme cases.
     static constexpr double MAX_REPLY_WAIT_S = 5.0;
 
     // --- Publishers ---
