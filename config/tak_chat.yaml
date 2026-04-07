@@ -32,7 +32,7 @@ robot_names (string, default: "[]")
     If provided, overrides robot_name parameter.
     Example: "['warthog1', 'warthog2', 'warthog3']"
 
-android_id (string, default: "dfac01d76beec661")
+android_id (string, default: "0c77ece62f0298f8")
     Android device ID for GeoChat UID generation.
 
 tak_server_flow_tag_key (string, default: "TAK-Server-...")

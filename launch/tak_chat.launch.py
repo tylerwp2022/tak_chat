@@ -148,7 +148,7 @@ def launch_tak_chat_nodes(context, *args, **kwargs):
                 ],
                 remappings=[
                     # Remap navsat to actual GPS topic within namespace
-                    ("navsat", "sensors/ublox/fix"),
+                    ("navsat", "sensors/geofog/gps/fix"),
                 ],
                 output="screen",
                 emulate_tty=True,
@@ -200,7 +200,7 @@ def launch_tak_chat_nodes(context, *args, **kwargs):
                 }
             ],
             remappings=[
-                ("navsat", "sensors/ublox/fix"),
+                ("navsat", "sensors/geofog/gps/fix"),
             ],
             output="screen",
             emulate_tty=True,
@@ -250,11 +250,11 @@ def generate_launch_description():
         "known_device_uids",
         # Pre-seed TRILL's device UID so outgoing unicasts are correct
         # even before TRILL has sent us a message in the current session.
-        default_value="['TRILL:ANDROID-49c8964ab97f24bc']",
+        default_value="['TRILL:ANDROID-0c77ece62f0298f8']",
         description=(
             "Pre-populated callsign->device UID map. "
             "Format: \"['CALLSIGN:DEVICE_UID', ...]\" "
-            "Example: \"['TRILL:ANDROID-49c8964ab97f24bc', 'OTHER:ANDROID-abc123']\""
+            "Example: \"['TRILL:ANDROID-0c77ece62f0298f8', 'OTHER:ANDROID-abc123']\""
         ),
     )
 
