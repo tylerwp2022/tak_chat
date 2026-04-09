@@ -1,282 +1,311 @@
 """
 ================================================================================
-Launch file for tak_chat_node - supports single and multi-robot deployments
+Launch file for tak_chat_node — single and multi-robot deployments
 ================================================================================
 
-SINGLE ROBOT USAGE:
--------------------
-# Default robot (warthog1)
-ros2 launch tak_chat tak_chat.launch.py
+PETAAR26 INTEGRATION:
+    All parameter defaults are sourced from the petaar26 package config files:
+      config/tak_params.yaml  → tak_server_flow_tag_key, known_device_uids
+      config/paths.yaml       → allowed_callsigns_file (cot_runner_yaml)
+      profiles.json → gps_topic_suffix drives this value
 
-# Specify different robot
-ros2 launch tak_chat tak_chat.launch.py robot_name:=warthog2
+BUG FIX (vs prior version):
+    The navsat remapping was previously hardcoded to "sensors/geofog/gps/fix"
+    in both single and multi-robot modes. NAI_3 and NAI_4 use u-blox GPS
+    (/sensors/ublox/fix), so tak_chat was receiving no GPS position data on
+    those conditions — TAK position CoTs were either stale or not sent.
+
+    FIX: Added navsat_topic launch argument (default = geofog for backward
+    compatibility). sim_control.py now passes the active profile's
+    gps_topic_suffix as navsat_topic when launching tak_chat.
+
+SINGLE ROBOT USAGE:
+    # Default robot (warthog1) with default GPS (geofog):
+    ros2 launch tak_chat tak_chat.launch.py
+
+    # Specify different robot and GPS hardware:
+    ros2 launch tak_chat tak_chat.launch.py \
+        robot_name:=warthog2 \
+        navsat_topic:=sensors/ublox/fix
 
 MULTI-ROBOT USAGE:
-------------------
-# Launch multiple robots (overrides robot_name parameter)
-ros2 launch tak_chat tak_chat.launch.py \
-    robot_names:="['warthog1', 'warthog2', 'warthog3']"
-
-# Multi-robot with custom TAK server
-ros2 launch tak_chat tak_chat.launch.py \
-    robot_names:="['warthog1', 'warthog2']" \
-    tak_server_flow_tag_key:=TAK-Server-custom-uuid
+    ros2 launch tak_chat tak_chat.launch.py \
+        robot_names:="['warthog1', 'warthog2', 'warthog3']" \
+        navsat_topic:=sensors/ublox/fix
 
 PARAMETERS:
------------
-robot_name (string, default: "warthog1")
-    Single robot's name. Ignored if robot_names is specified.
+    robot_name (string, default: "warthog1")
+        Single robot name. Ignored if robot_names is provided.
 
-robot_names (string, default: "[]")
-    List of robot names for multi-robot deployment (Python list format).
-    If provided, overrides robot_name parameter.
-    Example: "['warthog1', 'warthog2', 'warthog3']"
+    robot_names (string, default: "[]")
+        Python list of robot names for multi-robot mode.
+        Example: "['warthog1', 'warthog2', 'warthog3']"
 
-tak_server_flow_tag_key (string, default: "TAK-Server-...")
-    Flow tag key for TAK server.
+    navsat_topic (string, default: "sensors/geofog/gps/fix")
+        GPS topic to remap navsat to within each robot namespace.
+        ROBOT-RELATIVE (no leading slash, no robot_name prefix).
+        The ROS2 namespace mechanism prepends the robot name automatically.
+          geofog hardware (NAI_2, testing): sensors/geofog/gps/fix
+          u-blox  hardware (NAI_3, NAI_4): sensors/ublox/fix
+        Driven by gps_topic_suffix in the active profile (profiles.json).
 
-known_device_uids (string, default: "['TRILL:ANDROID-49c8964ab97f24bc']")
-    Pre-populated callsign->device UID mappings.
-    Format: "['CALLSIGN:DEVICE_UID', ...]"
-    WHY: The UID map is normally learned from incoming messages, but the BT
-    tree may send outgoing unicasts before any message has been received.
-    Pre-populating ensures correct chatgrp uid1 routing on first send.
+    tak_server_flow_tag_key (string, default: from petaar26 tak_params.yaml)
+        Flow tag key for TAK server. Default from config/tak_params.yaml.
+
+    known_device_uids (string, default: from petaar26 tak_params.yaml)
+        Pre-populated callsign→device UID map.
+        Format: "['CALLSIGN:ANDROID-hex', ...]"
+        WHY: The UID map is normally learned from incoming messages, but BT
+        nodes may send unicasts before any message has been received from the
+        operator. Pre-populating ensures correct chatgrp uid1 on first send.
+        Default from config/tak_params.yaml → tak.known_device_uids.
 
 ================================================================================
 """
 
+import ast
+import os
+import yaml
+
+from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, OpaqueFunction
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
-import ast
 
+
+# =============================================================================
+# PETAAR26 CONFIG LOADER
+# =============================================================================
+
+def _petaar26(filename: str) -> dict:
+    """Load a petaar26 config YAML from the installed share directory."""
+    path = os.path.join(
+        get_package_share_directory('petaar26'),
+        'config', filename
+    )
+    with open(path) as f:
+        return yaml.safe_load(f)
+
+
+_tak    = _petaar26('tak_params.yaml')['tak']
+_topics = _petaar26('topics.yaml')['topics']
+_paths  = _petaar26('paths.yaml')['paths']
+_hw     = _petaar26('hardware.yaml')['hardware']
+
+
+# =============================================================================
+# DYNAMIC NODE CREATION
+# =============================================================================
 
 def launch_tak_chat_nodes(context, *args, **kwargs):
     """
     Dynamically create tak_chat nodes based on configuration.
 
-    This function handles both single-robot and multi-robot scenarios:
-      - If robot_names is provided (non-empty list): Launch multiple robots
-      - Otherwise: Launch single robot using robot_name parameter
+    Handles both single-robot and multi-robot scenarios:
+      - If robot_names is a non-empty list: launch one node per robot.
+      - Otherwise: launch a single node using robot_name.
 
-    Args:
-        context: Launch context containing parameter values
-
-    Returns:
-        List of Node objects to launch
+    The navsat remapping is applied per-node using the navsat_topic argument,
+    which resolves to the active GPS hardware topic for the current profile.
     """
 
-    # Get launch configuration values
-    robot_names_str = LaunchConfiguration("robot_names").perform(context)
-    robot_name_single = LaunchConfiguration("robot_name").perform(context)
-    tak_server_flow_tag_key = LaunchConfiguration("tak_server_flow_tag_key").perform(
-        context
-    )
-    known_device_uids_str = LaunchConfiguration("known_device_uids").perform(context)
+    # -------------------------------------------------------------------------
+    # Resolve launch configuration values
+    # -------------------------------------------------------------------------
+    robot_names_str         = LaunchConfiguration('robot_names').perform(context)
+    robot_name_single       = LaunchConfiguration('robot_name').perform(context)
+    tak_server_flow_tag_key = LaunchConfiguration('tak_server_flow_tag_key').perform(context)
+    known_device_uids_str   = LaunchConfiguration('known_device_uids').perform(context)
 
-    # Parse known_device_uids list
-    # Format: "['TRILL:ANDROID-49c8964ab97f24bc', 'OTHER:ANDROID-...']"
+    # navsat_topic is ROBOT-RELATIVE (no leading slash, no namespace prefix).
+    # The ROS2 namespace + remapping system resolves it to the full topic path.
+    # Example: "sensors/ublox/fix" → /warthog1/sensors/ublox/fix
+    navsat_topic = LaunchConfiguration('navsat_topic').perform(context)
+
+    # -------------------------------------------------------------------------
+    # Parse known_device_uids  (Python list string → Python list)
+    # -------------------------------------------------------------------------
     known_device_uids = []
     try:
         parsed_uids = ast.literal_eval(known_device_uids_str)
         if isinstance(parsed_uids, list):
             known_device_uids = parsed_uids
     except Exception:
-        pass
+        pass  # Malformed string — fall back to empty list; node will log a warning.
 
-    # Determine if we're in multi-robot mode
+    # -------------------------------------------------------------------------
+    # Determine single vs multi-robot mode
+    # -------------------------------------------------------------------------
     robot_names = []
     try:
-        # Try to parse robot_names as a Python list
         parsed = ast.literal_eval(robot_names_str)
         if isinstance(parsed, list) and len(parsed) > 0:
             robot_names = parsed
     except Exception:
-        # If parsing fails or result is not a list, fall back to single robot
-        pass
+        pass  # Fall back to single-robot mode.
 
-    # Create nodes based on mode
+    # -------------------------------------------------------------------------
+    # Common node parameters (identical for single and multi-robot modes)
+    # -------------------------------------------------------------------------
+    def _node_params(robot_name: str) -> dict:
+        return {
+            'callsign':                robot_name,
+            'tak_server_flow_tag_key': tak_server_flow_tag_key,
+            # Topic names — robot-relative, resolved within the node namespace.
+            'outgoing_cot_topic':      'send_to_tak',
+            'incoming_cot_topic':      'incoming_cot',
+            'navsat_topic':            'navsat',          # remapped below to active GPS
+            'tak_chat_out_topic':      'tak_chat/out',
+            'tak_chat_in_topic':       'tak_chat/in',
+            'comms_topic':             'comms',
+            # Allowed callsigns config — sourced from config/paths.yaml.
+            'allowed_callsigns_file':  _paths['cot_runner_yaml'],
+            # Timing and retry parameters.
+            'send_delay_s':            1.0,
+            'reply_delay_s':           1.0,
+            'retry_timeout_s':         10.0,
+            'retry_interval_s':        1.0,
+            'min_retry_count':         1,
+            # Pre-seeded UID map — ensures correct chatgrp routing before first
+            # inbound message. Sourced from config/tak_params.yaml.
+            'known_device_uids':       known_device_uids,
+        }
+
+    def _node_remappings(navsat_topic: str) -> list:
+        # Remap tak_chat_node's internal 'navsat' topic to the active GPS topic.
+        # navsat_topic is robot-relative, e.g. "sensors/ublox/fix".
+        # Within the robot namespace this resolves to /warthog1/sensors/ublox/fix.
+        return [('navsat', navsat_topic)]
+
+    # =========================================================================
+    # MULTI-ROBOT MODE
+    # =========================================================================
     nodes = []
 
     if robot_names:
-        # =====================================================================
-        # MULTI-ROBOT MODE
-        # =====================================================================
-        # Launch one tak_chat_node for each robot in the list
-
         print(f"\n{'='*80}")
         print(f"TAK CHAT MULTI-ROBOT MODE: Launching {len(robot_names)} robots")
+        print(f"  navsat_topic → {navsat_topic}")
         print(f"{'='*80}")
 
         for idx, robot_name in enumerate(robot_names, 1):
-            print(
-                f"  [{idx}/{len(robot_names)}] Configuring TAK chat for: {robot_name}"
+            print(f"  [{idx}/{len(robot_names)}] Configuring TAK chat for: {robot_name}")
+            nodes.append(
+                Node(
+                    package='tak_chat',
+                    executable='tak_chat_node',
+                    name=f'tak_chat_node_{robot_name}',
+                    namespace=robot_name,
+                    parameters=[_node_params(robot_name)],
+                    remappings=_node_remappings(navsat_topic),
+                    output='screen',
+                    emulate_tty=True,
+                )
             )
-
-            node = Node(
-                package="tak_chat",
-                executable="tak_chat_node",
-                # Give each node a unique name to avoid conflicts
-                name=f"tak_chat_node_{robot_name}",
-                # Use namespace to isolate each robot's topics
-                namespace=robot_name,
-                parameters=[
-                    {
-                        # Use robot_name as callsign (matches namespace)
-                        "callsign": robot_name,
-                        "tak_server_flow_tag_key": tak_server_flow_tag_key,
-                        # Topic configuration (relative to namespace)
-                        "outgoing_cot_topic": "send_to_tak",
-                        "incoming_cot_topic": "incoming_cot",
-                        "navsat_topic": "navsat",
-                        "tak_chat_out_topic": "tak_chat/out",
-                        "tak_chat_in_topic": "tak_chat/in",
-                        "comms_topic": "comms",
-                        # Allowed callsigns configuration
-                        "allowed_callsigns_file": "/phoenix/src/phoenix-tak/src/tak_bridge/config/cot_runner.yaml",
-                        # Timing/retry parameters
-                        "send_delay_s": 1.0,
-                        "reply_delay_s": 1.0,
-                        "retry_timeout_s": 10.0,
-                        "retry_interval_s": 1.0,
-                        "min_retry_count": 1,
-                        # Pre-populated callsign -> device UID map.
-                        # Ensures correct chatgrp uid1 before any message is received.
-                        "known_device_uids": known_device_uids,
-                    }
-                ],
-                remappings=[
-                    # Remap navsat to actual GPS topic within namespace
-                    ("navsat", "sensors/geofog/gps/fix"),
-                ],
-                output="screen",
-                emulate_tty=True,
-                # Optional: Auto-restart if node crashes
-                # respawn=True,
-                # respawn_delay=2.0,
-            )
-            nodes.append(node)
 
         print(f"{'='*80}\n")
 
+    # =========================================================================
+    # SINGLE-ROBOT MODE (DEFAULT)
+    # =========================================================================
     else:
-        # =====================================================================
-        # SINGLE-ROBOT MODE (DEFAULT)
-        # =====================================================================
-        # Launch one node with the specified robot_name
-
         print(f"\n{'='*80}")
         print(f"TAK CHAT SINGLE-ROBOT MODE: Launching {robot_name_single}")
+        print(f"  navsat_topic → {navsat_topic}")
         print(f"{'='*80}\n")
 
-        node = Node(
-            package="tak_chat",
-            executable="tak_chat_node",
-            name="tak_chat_node",
-            namespace=robot_name_single,
-            parameters=[
-                {
-                    "callsign": robot_name_single,
-                    "tak_server_flow_tag_key": tak_server_flow_tag_key,
-                    # Topic configuration (relative to namespace)
-                    "outgoing_cot_topic": "send_to_tak",
-                    "incoming_cot_topic": "incoming_cot",
-                    "navsat_topic": "navsat",
-                    "tak_chat_out_topic": "tak_chat/out",
-                    "tak_chat_in_topic": "tak_chat/in",
-                    "comms_topic": "comms",
-                    # Allowed callsigns configuration
-                    "allowed_callsigns_file": "/phoenix/src/phoenix-tak/src/tak_bridge/config/cot_runner.yaml",
-                    # Timing/retry parameters
-                    "send_delay_s": 1.0,
-                    "reply_delay_s": 1.0,
-                    "retry_timeout_s": 10.0,
-                    "retry_interval_s": 1.0,
-                    "min_retry_count": 1,
-                    # Pre-populated callsign -> device UID map.
-                    # Ensures correct chatgrp uid1 before any message is received.
-                    "known_device_uids": known_device_uids,
-                }
-            ],
-            remappings=[
-                ("navsat", "sensors/geofog/gps/fix"),
-            ],
-            output="screen",
-            emulate_tty=True,
-            # Optional: Auto-restart if node crashes
-            # respawn=True,
-            # respawn_delay=2.0,
+        nodes.append(
+            Node(
+                package='tak_chat',
+                executable='tak_chat_node',
+                name='tak_chat_node',
+                namespace=robot_name_single,
+                parameters=[_node_params(robot_name_single)],
+                remappings=_node_remappings(navsat_topic),
+                output='screen',
+                emulate_tty=True,
+            )
         )
-        nodes.append(node)
 
     return nodes
 
 
-def generate_launch_description():
-    """
-    Generate the launch description with configurable parameters.
+# =============================================================================
+# LAUNCH DESCRIPTION
+# =============================================================================
 
-    This function is called by the ROS2 launch system to construct the
-    launch description. It:
-      1. Declares launch arguments (command-line parameters)
-      2. Uses OpaqueFunction to dynamically create nodes based on arguments
-      3. Returns the complete launch description
-    """
+def generate_launch_description():
 
     # =========================================================================
-    # DECLARE LAUNCH ARGUMENTS
+    # LAUNCH ARGUMENTS
     # =========================================================================
 
     robot_name_arg = DeclareLaunchArgument(
-        "robot_name",
-        default_value="warthog1",
-        description="Single robot name (ignored if robot_names is provided)",
+        'robot_name',
+        default_value='warthog1',
+        description='Single robot name (ignored if robot_names is provided).',
     )
 
     robot_names_arg = DeclareLaunchArgument(
-        "robot_names",
-        default_value="[]",
-        description="List of robot names for multi-robot mode: \"['warthog1', 'warthog2']\"",
-    )
-
-    tak_server_flow_tag_key_arg = DeclareLaunchArgument(
-        "tak_server_flow_tag_key",
-        default_value="TAK-Server-d520578543014e9cba1916fad77b9917",
-        description="Flow tag key for TAK server",
-    )
-
-    known_device_uids_arg = DeclareLaunchArgument(
-        "known_device_uids",
-        # Pre-seed TRILL's device UID so outgoing unicasts are correct
-        # even before TRILL has sent us a message in the current session.
-        default_value="['TRILL:ANDROID-0c77ece62f0298f8']",
+        'robot_names',
+        default_value='[]',
         description=(
-            "Pre-populated callsign->device UID map. "
-            "Format: \"['CALLSIGN:DEVICE_UID', ...]\" "
-            "Example: \"['TRILL:ANDROID-0c77ece62f0298f8', 'OTHER:ANDROID-abc123']\""
+            "Python list of robot names for multi-robot mode. "
+            "Overrides robot_name when non-empty. "
+            "Example: \"['warthog1', 'warthog2', 'warthog3']\""
         ),
     )
 
-    # =========================================================================
-    # DYNAMIC NODE CREATION
-    # =========================================================================
-    # Use OpaqueFunction to create nodes at runtime based on parameters
-
-    launch_nodes = OpaqueFunction(function=launch_tak_chat_nodes)
-
-    # =========================================================================
-    # RETURN LAUNCH DESCRIPTION
-    # =========================================================================
-
-    return LaunchDescription(
-        [
-            # Declare launch arguments
-            robot_name_arg,
-            robot_names_arg,
-            tak_server_flow_tag_key_arg,
-            known_device_uids_arg,
-            # Dynamically create nodes
-            launch_nodes,
-        ]
+    navsat_topic_arg = DeclareLaunchArgument(
+        'navsat_topic',
+        # Default is the geofog topic for backward compatibility.
+        # sim_control.py passes the active profile's gps_topic_suffix here,
+        # selecting between geofog (NAI_2, testing) and ublox (NAI_3, NAI_4).
+        #
+        # IMPORTANT: This must be ROBOT-RELATIVE (no leading slash, no robot_name).
+        # The ROS2 namespace mechanism prepends the robot name automatically.
+        # "sensors/ublox/fix" → /warthog1/sensors/ublox/fix  (warthog1 namespace)
+        #
+        # WHY THIS FIX: The previous version had this hardcoded to
+        # "sensors/geofog/gps/fix" in both single and multi-robot modes.
+        # That meant NAI_3 and NAI_4 runs used the wrong GPS topic — tak_chat
+        # received no position data and TAK CoTs had stale or missing coordinates.
+        default_value=_hw['gps_topic_suffix'],
+        description=(
+            "GPS topic to remap 'navsat' to within each robot namespace. "
+            "Must be ROBOT-RELATIVE (no leading slash). "
+            "Options: sensors/geofog/gps/fix (GeoFog, NAI_2) "
+            "or sensors/ublox/fix (u-blox, NAI_3/NAI_4). "
+            "Driven by gps_topic_suffix in the active profile (profiles.json)."
+        ),
     )
+
+    tak_server_flow_tag_key_arg = DeclareLaunchArgument(
+        'tak_server_flow_tag_key',
+        default_value=_tak['flow_tag'],      # from config/tak_params.yaml
+        description=(
+            "Flow tag key identifying the TAK server connection. "
+            "Default from config/tak_params.yaml → tak.flow_tag."
+        ),
+    )
+
+    known_device_uids_arg = DeclareLaunchArgument(
+        'known_device_uids',
+        default_value=str(_tak['known_device_uids']),  # from config/tak_params.yaml
+        description=(
+            "Pre-seeded callsign→device UID map for correct unicast routing "
+            "before the first inbound message is received. "
+            "Format: \"['CALLSIGN:ANDROID-hex', ...]\" "
+            "Default from config/tak_params.yaml → tak.known_device_uids."
+        ),
+    )
+
+    return LaunchDescription([
+        robot_name_arg,
+        robot_names_arg,
+        navsat_topic_arg,
+        tak_server_flow_tag_key_arg,
+        known_device_uids_arg,
+        OpaqueFunction(function=launch_tak_chat_nodes),
+    ])
