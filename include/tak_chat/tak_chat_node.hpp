@@ -188,6 +188,11 @@ public:
         declare_parameter<double>("reply_delay_s", 1.0);
         declare_parameter<std::vector<std::string>>("known_device_uids",
                                                     std::vector<std::string>{});
+        // Whether to suppress outgoing messages when base_station comms are down.
+        // Set to false during bench testing or any scenario where the comms sim
+        // is not running / not meaningful. Togglable at runtime without restart:
+        //   ros2 param set /warthog1/tak_chat_node enable_comms_gate false
+        declare_parameter<bool>("enable_comms_gate", true);
 
         //----------------------------------------------------------------------
         // Read parameters
@@ -199,13 +204,71 @@ public:
         min_retry_count_ = get_parameter("min_retry_count").as_int();
         send_delay_s_ = get_parameter("send_delay_s").as_double();
         reply_delay_s_ = get_parameter("reply_delay_s").as_double();
+        enable_comms_gate_ = get_parameter("enable_comms_gate").as_bool();
+
+        // Register a dynamic parameter callback so enable_comms_gate can be
+        // toggled at runtime without restarting the node.
+        // NOTE: The handle MUST be stored as a member — dropping it deregisters
+        // the callback immediately.
+        param_cb_handle_ = add_on_set_parameters_callback(
+            [this](const std::vector<rclcpp::Parameter> &params)
+            {
+                rcl_interfaces::msg::SetParametersResult result;
+                result.successful = true;
+                for (const auto &p : params)
+                {
+                    if (p.get_name() == "enable_comms_gate")
+                    {
+                        const bool new_val = p.as_bool();
+                        const bool old_val = enable_comms_gate_.exchange(new_val);
+
+                        if (new_val == old_val)
+                            continue; // No change — nothing to do
+
+                        if (new_val)
+                        {
+                            // Gate re-enabled: reset comms state and subscribe.
+                            // Reset state so we don't carry over a stale
+                            // comms_status_received_ = true from before the gate
+                            // was disabled (which would make hasComms() report
+                            // the last-known status rather than waiting for a
+                            // fresh update).
+                            {
+                                std::lock_guard<std::mutex> lock(comms_mutex_);
+                                comms_status_received_ = false;
+                                has_base_station_comms_ = false;
+                            }
+                            const auto qos = rclcpp::QoS(rclcpp::KeepLast(10))
+                                                 .reliable()
+                                                 .durability_volatile();
+                            sub_comms_status_ = createCommsSubscription(qos);
+                            RCLCPP_WARN(get_logger(),
+                                "[CommsGate] Comms gating ENABLED — subscribed to %s. "
+                                "Messages will be suppressed when comms are down.",
+                                comms_topic_.c_str());
+                        }
+                        else
+                        {
+                            // Gate disabled: tear down the subscription so we
+                            // stop receiving comms updates entirely. hasComms()
+                            // will return true unconditionally.
+                            sub_comms_status_.reset();
+                            RCLCPP_WARN(get_logger(),
+                                "[CommsGate] Comms gating DISABLED — unsubscribed from %s. "
+                                "All messages will be sent regardless of comms status.",
+                                comms_topic_.c_str());
+                        }
+                    }
+                }
+                return result;
+            });
 
         const auto outgoing_cot_topic = get_parameter("outgoing_cot_topic").as_string();
         const auto incoming_cot_topic = get_parameter("incoming_cot_topic").as_string();
         const auto navsat_topic = get_parameter("navsat_topic").as_string();
         const auto tak_chat_out_topic = get_parameter("tak_chat_out_topic").as_string();
         const auto tak_chat_in_topic = get_parameter("tak_chat_in_topic").as_string();
-        const auto comms_topic = get_parameter("comms_topic").as_string();
+        comms_topic_ = get_parameter("comms_topic").as_string();
         const auto allowed_callsigns_file = get_parameter("allowed_callsigns_file").as_string();
 
         //----------------------------------------------------------------------
@@ -239,9 +302,24 @@ public:
             navsat_topic, qos,
             std::bind(&TakChatNode::navsatCallback, this, std::placeholders::_1));
 
-        sub_comms_status_ = create_subscription<west_point_comms_sim::msg::CommsStatus>(
-            comms_topic, qos,
-            std::bind(&TakChatNode::commsStatusCallback, this, std::placeholders::_1));
+        // Only subscribe to comms status if the gate is enabled. When the gate
+        // is disabled the subscription is intentionally absent — no comms topic
+        // traffic, no comms_status_received_ state, and hasComms() returns true
+        // unconditionally. The subscription is created/destroyed dynamically if
+        // enable_comms_gate is toggled at runtime via ros2 param set.
+        if (enable_comms_gate_)
+        {
+            sub_comms_status_ = createCommsSubscription(qos);
+            RCLCPP_INFO(get_logger(), "[CommsGate] Comms gating ENABLED — subscribed to %s",
+                        comms_topic_.c_str());
+        }
+        else
+        {
+            RCLCPP_WARN(get_logger(),
+                        "[CommsGate] Comms gating DISABLED — NOT subscribing to %s. "
+                        "All messages will be sent regardless of comms status.",
+                        comms_topic_.c_str());
+        }
 
         // Event callbacks on tak_chat/out subscription for discovery diagnostics
         rclcpp::SubscriptionOptions sub_opts;
@@ -321,9 +399,33 @@ public:
         RCLCPP_INFO(get_logger(), "  retry_timeout_s:   %.1f", retry_timeout_s_);
         RCLCPP_INFO(get_logger(), "  min_retry_count:   %d", min_retry_count_);
         RCLCPP_INFO(get_logger(), "  known UIDs:        %zu pre-loaded", callsign_to_device_uid_.size());
+        RCLCPP_INFO(get_logger(), "  enable_comms_gate: %s",
+                    enable_comms_gate_ ? "true" : "false");
     }
 
 private:
+    //==========================================================================
+    // SECTION: COMMS SUBSCRIPTION MANAGEMENT
+    //==========================================================================
+
+    /**
+     * @brief Create (or recreate) the comms status subscription.
+     *
+     * Factored out so it can be called both from the constructor (when
+     * enable_comms_gate is true at startup) and from the parameter callback
+     * (when enable_comms_gate is toggled on at runtime).
+     *
+     * Callers are responsible for resetting comms state before calling this
+     * if re-enabling after a period of being disabled.
+     */
+    rclcpp::Subscription<west_point_comms_sim::msg::CommsStatus>::SharedPtr
+    createCommsSubscription(const rclcpp::QoS &qos)
+    {
+        return create_subscription<west_point_comms_sim::msg::CommsStatus>(
+            comms_topic_, qos,
+            std::bind(&TakChatNode::commsStatusCallback, this, std::placeholders::_1));
+    }
+
     //==========================================================================
     // SECTION: YAML LOADING
     //==========================================================================
@@ -457,6 +559,11 @@ private:
     bool hasComms()
     {
         std::lock_guard<std::mutex> lock(comms_mutex_);
+        // Gate bypass: if enable_comms_gate_ is false, always report comms OK.
+        // Useful for bench testing when the comms sim is not running, or for
+        // experimental conditions where comms gating is not desired.
+        if (!enable_comms_gate_)
+            return true;
         // If comms_sim is not running, default to comms OK
         return !comms_status_received_ || has_base_station_comms_;
     }
@@ -1973,6 +2080,17 @@ private:
     std::mutex comms_mutex_;
     bool comms_status_received_;
     bool has_base_station_comms_;
+    std::string comms_topic_; // Stored for subscription recreation on gate toggle
+    // Whether the comms gate is active. When false, hasComms() always returns
+    // true regardless of comms sim status. Togglable at runtime via:
+    //   ros2 param set /<ns>/tak_chat_node enable_comms_gate false
+    // std::atomic so the parameter callback thread can write it safely while
+    // hasComms() reads it (under comms_mutex_ on the timer thread).
+    std::atomic<bool> enable_comms_gate_{true};
+
+    // Must be kept alive for the duration of the node — dropping this handle
+    // deregisters the dynamic parameter callback.
+    rclcpp::node_interfaces::OnSetParametersCallbackHandle::SharedPtr param_cb_handle_;
 
     // --- Send queue ---
     std::deque<QueuedMessage> send_queue_;

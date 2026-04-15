@@ -167,6 +167,11 @@ def launch_tak_chat_nodes(context, *args, **kwargs):
             'retry_timeout_s':         10.0,
             'retry_interval_s':        1.0,
             'min_retry_count':         1,
+            # Comms gating — set to False to bypass the base_station reachability
+            # check (useful for bench testing without the comms sim running).
+            # Also togglable at runtime:
+            #   ros2 param set /<robot>/tak_chat_node enable_comms_gate false
+            'enable_comms_gate':       True,
             # Pre-seeded UID map — ensures correct chatgrp routing before first
             # inbound message. Sourced from config/tak_params.yaml.
             'known_device_uids':       known_device_uids,
