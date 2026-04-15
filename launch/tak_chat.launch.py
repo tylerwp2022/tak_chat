@@ -28,6 +28,10 @@ SINGLE ROBOT USAGE:
         robot_name:=warthog2 \
         navsat_topic:=sensors/ublox/fix
 
+    # Disable comms gating (bench testing, no comms sim running):
+    ros2 launch tak_chat tak_chat.launch.py \
+        enable_comms_gate:=false
+
 MULTI-ROBOT USAGE:
     ros2 launch tak_chat tak_chat.launch.py \
         robot_names:="['warthog1', 'warthog2', 'warthog3']" \
@@ -59,6 +63,16 @@ PARAMETERS:
         nodes may send unicasts before any message has been received from the
         operator. Pre-populating ensures correct chatgrp uid1 on first send.
         Default from config/tak_params.yaml → tak.known_device_uids.
+
+    enable_comms_gate (bool, default: true)
+        Whether to gate outgoing TAK messages on base_station comms reachability.
+        When true (default): messages are suppressed and the node subscribes to
+        the comms topic to track connectivity. When false: all messages are sent
+        regardless of comms status and the comms topic subscription is not
+        created at all.
+        Use false for bench testing or any scenario where the comms sim is not
+        running. Can also be toggled at runtime without restarting the node:
+          ros2 param set /<robot_name>/tak_chat_node enable_comms_gate false
 
 ================================================================================
 """
@@ -123,6 +137,9 @@ def launch_tak_chat_nodes(context, *args, **kwargs):
     # Example: "sensors/ublox/fix" → /warthog1/sensors/ublox/fix
     navsat_topic = LaunchConfiguration('navsat_topic').perform(context)
 
+    # Launch args are always strings — convert "true"/"false" to bool.
+    enable_comms_gate = LaunchConfiguration('enable_comms_gate').perform(context).lower() == 'true'
+
     # -------------------------------------------------------------------------
     # Parse known_device_uids  (Python list string → Python list)
     # -------------------------------------------------------------------------
@@ -167,11 +184,11 @@ def launch_tak_chat_nodes(context, *args, **kwargs):
             'retry_timeout_s':         10.0,
             'retry_interval_s':        1.0,
             'min_retry_count':         1,
-            # Comms gating — set to False to bypass the base_station reachability
-            # check (useful for bench testing without the comms sim running).
-            # Also togglable at runtime:
+            # Comms gating — when false the node does not subscribe to the comms
+            # topic and sends all messages regardless of base_station reachability.
+            # Also togglable at runtime without restart:
             #   ros2 param set /<robot>/tak_chat_node enable_comms_gate false
-            'enable_comms_gate':       True,
+            'enable_comms_gate':       enable_comms_gate,
             # Pre-seeded UID map — ensures correct chatgrp routing before first
             # inbound message. Sourced from config/tak_params.yaml.
             'known_device_uids':       known_device_uids,
@@ -191,7 +208,8 @@ def launch_tak_chat_nodes(context, *args, **kwargs):
     if robot_names:
         print(f"\n{'='*80}")
         print(f"TAK CHAT MULTI-ROBOT MODE: Launching {len(robot_names)} robots")
-        print(f"  navsat_topic → {navsat_topic}")
+        print(f"  navsat_topic      → {navsat_topic}")
+        print(f"  enable_comms_gate → {enable_comms_gate}")
         print(f"{'='*80}")
 
         for idx, robot_name in enumerate(robot_names, 1):
@@ -217,7 +235,8 @@ def launch_tak_chat_nodes(context, *args, **kwargs):
     else:
         print(f"\n{'='*80}")
         print(f"TAK CHAT SINGLE-ROBOT MODE: Launching {robot_name_single}")
-        print(f"  navsat_topic → {navsat_topic}")
+        print(f"  navsat_topic      → {navsat_topic}")
+        print(f"  enable_comms_gate → {enable_comms_gate}")
         print(f"{'='*80}\n")
 
         nodes.append(
@@ -306,11 +325,27 @@ def generate_launch_description():
         ),
     )
 
+    enable_comms_gate_arg = DeclareLaunchArgument(
+        'enable_comms_gate',
+        default_value='true',
+        description=(
+            "Gate outgoing TAK messages on base_station comms reachability. "
+            "When true (default): messages are suppressed when the comms sim "
+            "reports no base_station link, and the node subscribes to the comms "
+            "topic. When false: all messages are sent unconditionally and the "
+            "comms topic subscription is not created. "
+            "Use false for bench testing when the comms sim is not running. "
+            "Also togglable at runtime without restarting the node: "
+            "ros2 param set /<robot_name>/tak_chat_node enable_comms_gate false"
+        ),
+    )
+
     return LaunchDescription([
         robot_name_arg,
         robot_names_arg,
         navsat_topic_arg,
         tak_server_flow_tag_key_arg,
         known_device_uids_arg,
+        enable_comms_gate_arg,
         OpaqueFunction(function=launch_tak_chat_nodes),
     ])
